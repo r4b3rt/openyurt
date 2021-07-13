@@ -17,6 +17,8 @@ limitations under the License.
 package kubernetes
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -24,19 +26,30 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openyurtio/openyurt/pkg/yurtctl/constants"
+	strutil "github.com/openyurtio/openyurt/pkg/yurtctl/util/strings"
+	tmplutil "github.com/openyurtio/openyurt/pkg/yurtctl/util/templates"
 	"github.com/spf13/pflag"
+
+	v1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
+	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
@@ -45,10 +58,6 @@ import (
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmcontants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	tokenphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
-
-	"github.com/openyurtio/openyurt/pkg/yurtctl/constants"
-	strutil "github.com/openyurtio/openyurt/pkg/yurtctl/util/strings"
-	tmplutil "github.com/openyurtio/openyurt/pkg/yurtctl/util/templates"
 )
 
 const (
@@ -65,14 +74,15 @@ var (
 	WaitServantJobTimeout = time.Minute * 2
 	// CheckServantJobPeriod defines the time interval between two successive ServantJob statu's inspection
 	CheckServantJobPeriod = time.Second * 10
-	// ValidServerVersions contains all compatable server version
+	// ValidServerVersions contains all compatible server version
 	// yurtctl only support Kubernetes 1.12+ - 1.16+ for now
 	ValidServerVersions = []string{
 		"1.12", "1.12+",
 		"1.13", "1.13+",
 		"1.14", "1.14+",
 		"1.16", "1.16+",
-		"1.18", "1.18+"}
+		"1.18", "1.18+",
+		"1.20", "1.20+"}
 )
 
 // CreateServiceAccountFromYaml creates the ServiceAccount from the yaml template.
@@ -85,7 +95,7 @@ func CreateServiceAccountFromYaml(cliSet *kubernetes.Clientset, ns, saTmpl strin
 	if !ok {
 		return fmt.Errorf("fail to assert serviceaccount: %v", err)
 	}
-	_, err = cliSet.CoreV1().ServiceAccounts(ns).Create(sa)
+	_, err = cliSet.CoreV1().ServiceAccounts(ns).Create(context.Background(), sa, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("fail to create the serviceaccount/%s: %v", sa.Name, err)
 	}
@@ -103,7 +113,7 @@ func CreateClusterRoleFromYaml(cliSet *kubernetes.Clientset, crTmpl string) erro
 	if !ok {
 		return fmt.Errorf("fail to assert clusterrole: %v", err)
 	}
-	_, err = cliSet.RbacV1().ClusterRoles().Create(cr)
+	_, err = cliSet.RbacV1().ClusterRoles().Create(context.Background(), cr, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("fail to create the clusterrole/%s: %v", cr.Name, err)
 	}
@@ -121,7 +131,7 @@ func CreateClusterRoleBindingFromYaml(cliSet *kubernetes.Clientset, crbTmpl stri
 	if !ok {
 		return fmt.Errorf("fail to assert clusterrolebinding: %v", err)
 	}
-	_, err = cliSet.RbacV1().ClusterRoleBindings().Create(crb)
+	_, err = cliSet.RbacV1().ClusterRoleBindings().Create(context.Background(), crb, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("fail to create the clusterrolebinding/%s: %v", crb.Name, err)
 	}
@@ -139,7 +149,7 @@ func CreateConfigMapFromYaml(cliSet *kubernetes.Clientset, ns, cmTmpl string) er
 	if !ok {
 		return fmt.Errorf("fail to assert configmap: %v", err)
 	}
-	_, err = cliSet.CoreV1().ConfigMaps(ns).Create(cm)
+	_, err = cliSet.CoreV1().ConfigMaps(ns).Create(context.Background(), cm, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("fail to create the configmap/%s: %v", cm.Name, err)
 	}
@@ -148,8 +158,8 @@ func CreateConfigMapFromYaml(cliSet *kubernetes.Clientset, ns, cmTmpl string) er
 }
 
 // CreateDeployFromYaml creates the Deployment from the yaml template.
-func CreateDeployFromYaml(cliSet *kubernetes.Clientset, ns, dplyTmpl string, context interface{}) error {
-	ycmdp, err := tmplutil.SubsituteTemplate(dplyTmpl, context)
+func CreateDeployFromYaml(cliSet *kubernetes.Clientset, ns, dplyTmpl string, ctx interface{}) error {
+	ycmdp, err := tmplutil.SubsituteTemplate(dplyTmpl, ctx)
 	if err != nil {
 		return err
 	}
@@ -161,7 +171,7 @@ func CreateDeployFromYaml(cliSet *kubernetes.Clientset, ns, dplyTmpl string, con
 	if !ok {
 		return errors.New("fail to assert Deployment")
 	}
-	if _, err = cliSet.AppsV1().Deployments(ns).Create(dply); err != nil {
+	if _, err = cliSet.AppsV1().Deployments(ns).Create(context.Background(), dply, metav1.CreateOptions{}); err != nil {
 		return err
 	}
 	klog.V(4).Infof("the deployment/%s is deployed", dply.Name)
@@ -169,8 +179,8 @@ func CreateDeployFromYaml(cliSet *kubernetes.Clientset, ns, dplyTmpl string, con
 }
 
 // CreateDaemonSetFromYaml creates the DaemonSet from the yaml template.
-func CreateDaemonSetFromYaml(cliSet *kubernetes.Clientset, dsTmpl string, context interface{}) error {
-	ytadstmp, err := tmplutil.SubsituteTemplate(dsTmpl, context)
+func CreateDaemonSetFromYaml(cliSet *kubernetes.Clientset, dsTmpl string, ctx interface{}) error {
+	ytadstmp, err := tmplutil.SubsituteTemplate(dsTmpl, ctx)
 	if err != nil {
 		return err
 	}
@@ -182,7 +192,7 @@ func CreateDaemonSetFromYaml(cliSet *kubernetes.Clientset, dsTmpl string, contex
 	if !ok {
 		return fmt.Errorf("fail to assert daemonset: %v", err)
 	}
-	_, err = cliSet.AppsV1().DaemonSets("kube-system").Create(ds)
+	_, err = cliSet.AppsV1().DaemonSets("kube-system").Create(context.Background(), ds, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("fail to create the daemonset/%s: %v", ds.Name, err)
 	}
@@ -200,11 +210,152 @@ func CreateServiceFromYaml(cliSet *kubernetes.Clientset, svcTmpl string) error {
 	if !ok {
 		return fmt.Errorf("fail to assert service: %v", err)
 	}
-	_, err = cliSet.CoreV1().Services("kube-system").Create(svc)
+	_, err = cliSet.CoreV1().Services("kube-system").Create(context.Background(), svc, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("fail to create the service/%s: %s", svc.Name, err)
 	}
 	klog.V(4).Infof("service/%s is created", svc.Name)
+	return nil
+}
+
+//add by yanyhui at 20210611
+// CreateRoleFromYaml creates the ClusterRole from the yaml template.
+func CreateRoleFromYaml(cliSet *kubernetes.Clientset, ns, crTmpl string) error {
+	obj, err := YamlToObject([]byte(crTmpl))
+	if err != nil {
+		return err
+	}
+	cr, ok := obj.(*rbacv1.Role)
+	if !ok {
+		return fmt.Errorf("fail to assert role: %v", err)
+	}
+	_, err = cliSet.RbacV1().Roles(ns).Create(context.Background(), cr, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("fail to create the role/%s: %v", cr.Name, err)
+	}
+	klog.V(4).Infof("role/%s is created", cr.Name)
+	return nil
+}
+
+// CreateRoleBindingFromYaml creates the ClusterRoleBinding from the yaml template.
+func CreateRoleBindingFromYaml(cliSet *kubernetes.Clientset, ns, crbTmpl string) error {
+	obj, err := YamlToObject([]byte(crbTmpl))
+	if err != nil {
+		return err
+	}
+	crb, ok := obj.(*rbacv1.RoleBinding)
+	if !ok {
+		return fmt.Errorf("fail to assert rolebinding: %v", err)
+	}
+	_, err = cliSet.RbacV1().RoleBindings(ns).Create(context.Background(), crb, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("fail to create the rolebinding/%s: %v", crb.Name, err)
+	}
+	klog.V(4).Infof("rolebinding/%s is created", crb.Name)
+	return nil
+}
+
+// CreateSecretFromYaml creates the Secret from the yaml template.
+func CreateSecretFromYaml(cliSet *kubernetes.Clientset, ns, saTmpl string) error {
+	obj, err := YamlToObject([]byte(saTmpl))
+	if err != nil {
+		return err
+	}
+	sa, ok := obj.(*corev1.Secret)
+	if !ok {
+		return fmt.Errorf("fail to assert secret: %v", err)
+	}
+	_, err = cliSet.CoreV1().Secrets(ns).Create(context.Background(), sa, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("fail to create the secret/%s: %v", sa.Name, err)
+	}
+	klog.V(4).Infof("secret/%s is created", sa.Name)
+
+	return nil
+}
+
+// CreateMutatingWebhookConfigurationFromYaml creates the Service from the yaml template.
+func CreateMutatingWebhookConfigurationFromYaml(cliSet *kubernetes.Clientset, svcTmpl string) error {
+	obj, err := YamlToObject([]byte(svcTmpl))
+	if err != nil {
+		return err
+	}
+	svc, ok := obj.(*v1beta1.MutatingWebhookConfiguration)
+	if !ok {
+		return fmt.Errorf("fail to assert mutatingwebhookconfiguration: %v", err)
+	}
+	_, err = cliSet.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Create(context.Background(), svc, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("fail to create the mutatingwebhookconfiguration/%s: %s", svc.Name, err)
+	}
+	klog.V(4).Infof("mutatingwebhookconfiguration/%s is created", svc.Name)
+
+	return nil
+}
+
+// CreateValidatingWebhookConfigurationFromYaml creates the Service from the yaml template.
+func CreateValidatingWebhookConfigurationFromYaml(cliSet *kubernetes.Clientset, svcTmpl string) error {
+	obj, err := YamlToObject([]byte(svcTmpl))
+	if err != nil {
+		return err
+	}
+	svc, ok := obj.(*v1beta1.ValidatingWebhookConfiguration)
+	if !ok {
+		return fmt.Errorf("fail to assert validatingwebhookconfiguration: %v", err)
+	}
+	_, err = cliSet.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Create(context.Background(), svc, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("fail to create the validatingwebhookconfiguration/%s: %s", svc.Name, err)
+	}
+	klog.V(4).Infof("validatingwebhookconfiguration/%s is created", svc.Name)
+
+	return nil
+}
+
+func CreateCRDFromYaml(clientset *kubernetes.Clientset, yurtAppManagerClient dynamic.Interface, nameSpace string, filebytes []byte) error {
+	var err error
+	decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(filebytes), 10000)
+	var rawObj runtime.RawExtension
+	err = decoder.Decode(&rawObj)
+	if err != nil {
+		return err
+	}
+	obj, gvk, err := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme).Decode(rawObj.Raw, nil, nil)
+	if err != nil {
+		return err
+	}
+	unstructuredMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return err
+	}
+	unstructuredObj := &unstructured.Unstructured{Object: unstructuredMap}
+	gr, err := restmapper.GetAPIGroupResources(clientset.Discovery())
+	if err != nil {
+		return err
+	}
+
+	mapper := restmapper.NewDiscoveryRESTMapper(gr)
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return err
+	}
+
+	var dri dynamic.ResourceInterface
+	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+		if unstructuredObj.GetNamespace() == "" {
+			unstructuredObj.SetNamespace(nameSpace)
+		}
+		dri = yurtAppManagerClient.Resource(mapping.Resource).Namespace(unstructuredObj.GetNamespace())
+	} else {
+		dri = yurtAppManagerClient.Resource(mapping.Resource)
+	}
+
+	objSecond, err := dri.Create(context.Background(), unstructuredObj, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	} else {
+		fmt.Printf("%s/%s created", objSecond.GetKind(), objSecond.GetName())
+	}
 	return nil
 }
 
@@ -221,7 +372,7 @@ func YamlToObject(yamlContent []byte) (runtime.Object, error) {
 // LabelNode add a new label (<key>=<val>) to the given node
 func LabelNode(cliSet *kubernetes.Clientset, node *v1.Node, key, val string) (*v1.Node, error) {
 	node.Labels[key] = val
-	newNode, err := cliSet.CoreV1().Nodes().Update(node)
+	newNode, err := cliSet.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +382,7 @@ func LabelNode(cliSet *kubernetes.Clientset, node *v1.Node, key, val string) (*v
 // AnnotateNode add a new annotation (<key>=<val>) to the given node
 func AnnotateNode(cliSet *kubernetes.Clientset, node *v1.Node, key, val string) (*v1.Node, error) {
 	node.Annotations[key] = val
-	newNode, err := cliSet.CoreV1().Nodes().Update(node)
+	newNode, err := cliSet.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +391,7 @@ func AnnotateNode(cliSet *kubernetes.Clientset, node *v1.Node, key, val string) 
 
 // RunJobAndCleanup runs the job, wait for it to be complete, and delete it
 func RunJobAndCleanup(cliSet *kubernetes.Clientset, job *batchv1.Job, timeout, period time.Duration) error {
-	job, err := cliSet.BatchV1().Jobs(job.GetNamespace()).Create(job)
+	job, err := cliSet.BatchV1().Jobs(job.GetNamespace()).Create(context.Background(), job, metav1.CreateOptions{})
 	if err != nil {
 		return err
 	}
@@ -251,7 +402,7 @@ func RunJobAndCleanup(cliSet *kubernetes.Clientset, job *batchv1.Job, timeout, p
 			return errors.New("wait for job to be complete timeout")
 		case <-time.After(period):
 			job, err := cliSet.BatchV1().Jobs(job.GetNamespace()).
-				Get(job.GetName(), metav1.GetOptions{})
+				Get(context.Background(), job.GetName(), metav1.GetOptions{})
 			if err != nil {
 				klog.Errorf("fail to get job(%s) when waiting for it to be succeeded: %s",
 					job.GetName(), err)
@@ -259,7 +410,7 @@ func RunJobAndCleanup(cliSet *kubernetes.Clientset, job *batchv1.Job, timeout, p
 			}
 			if job.Status.Succeeded == *job.Spec.Completions {
 				if err := cliSet.BatchV1().Jobs(job.GetNamespace()).
-					Delete(job.GetName(), &metav1.DeleteOptions{
+					Delete(context.Background(), job.GetName(), metav1.DeleteOptions{
 						PropagationPolicy: &PropagationPolicy,
 					}); err != nil {
 					klog.Errorf("fail to delete succeeded servant job(%s): %s",
@@ -273,7 +424,7 @@ func RunJobAndCleanup(cliSet *kubernetes.Clientset, job *batchv1.Job, timeout, p
 	}
 }
 
-// RunServantJobs launchs servant jobs on specified edge nodes
+// RunServantJobs launch servant jobs on specified edge nodes
 func RunServantJobs(cliSet *kubernetes.Clientset, tmplCtx map[string]string, edgeNodeNames []string, convert bool) error {
 	var wg sync.WaitGroup
 	servantJobTemplate := constants.ConvertServantJobTemplate
@@ -355,6 +506,22 @@ func GenClientSet(flags *pflag.FlagSet) (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(restCfg)
 }
 
+// GenDynamicClientSet generates the clientset based on command option, environment variable or
+// the default kubeconfig file
+func GenDynamicClientSet(flags *pflag.FlagSet) (dynamic.Interface, error) {
+	kubeconfigPath, err := PrepareKubeConfigPath(flags)
+	if err != nil {
+		return nil, err
+	}
+
+	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return dynamic.NewForConfig(restCfg)
+}
+
 // PrepareKubeConfigPath returns the path of cluster kubeconfig file
 func PrepareKubeConfigPath(flags *pflag.FlagSet) (string, error) {
 	kbCfgPath, err := flags.GetString("kubeconfig")
@@ -392,7 +559,7 @@ func GetOrCreateJoinTokenString(cliSet *kubernetes.Clientset) (string, error) {
 		FieldSelector: tokenSelector.String(),
 	}
 	klog.V(1).Infoln("[token] retrieving list of bootstrap tokens")
-	secrets, err := cliSet.CoreV1().Secrets(metav1.NamespaceSystem).List(listOptions)
+	secrets, err := cliSet.CoreV1().Secrets(metav1.NamespaceSystem).List(context.Background(), listOptions)
 	if err != nil {
 		return "", fmt.Errorf("%v%s", err, "failed to list bootstrap tokens")
 	}

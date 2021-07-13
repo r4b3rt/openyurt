@@ -17,6 +17,7 @@ limitations under the License.
 package certmanager
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -27,9 +28,12 @@ import (
 
 	"github.com/openyurtio/openyurt/pkg/projectinfo"
 	"github.com/openyurtio/openyurt/pkg/yurttunnel/constants"
+	"github.com/openyurtio/openyurt/pkg/yurttunnel/pki/certmanager/store"
 	"github.com/openyurtio/openyurt/pkg/yurttunnel/server/serveraddr"
 
 	certificates "k8s.io/api/certificates/v1beta1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	clicert "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
@@ -52,15 +56,30 @@ func NewYurttunnelServerCertManager(
 	)
 	_ = wait.PollUntil(5*time.Second, func() (bool, error) {
 		dnsNames, ips, err = serveraddr.GetYurttunelServerDNSandIP(clientset)
-		if err == nil {
-			return true, nil
+		if err != nil {
+			return false, err
 		}
-		klog.Errorf("failed to get DNS names and ips: %s", err)
-		return false, nil
+
+		// get clusterIP for tunnel server internal service
+		svc, err := clientset.CoreV1().Services(constants.YurttunnelServerServiceNs).Get(context.Background(), constants.YurttunnelServerInternalServiceName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			// compatible with versions that not supported x-tunnel-server-internal-svc
+			return true, nil
+		} else if err != nil {
+			return false, err
+		}
+
+		if svc.Spec.ClusterIP != "" && net.ParseIP(svc.Spec.ClusterIP) != nil {
+			ips = append(ips, net.ParseIP(svc.Spec.ClusterIP))
+			dnsNames = append(dnsNames, serveraddr.GetDefaultDomainsForSvc(svc.Namespace, svc.Name)...)
+		}
+
+		return true, nil
 	}, stopCh)
 	// add user specified DNS anems and IP addresses
 	dnsNames = append(dnsNames, clCertNames...)
 	ips = append(ips, clIPs...)
+	klog.Infof("subject of tunnel server certificate, ips=%#+v, dnsNames=%#+v", ips, dnsNames)
 
 	return newCertManager(
 		clientset,
@@ -103,7 +122,7 @@ func newCertManager(
 	organizations,
 	dnsNames []string, ipAddrs []net.IP) (certificate.Manager, error) {
 	certificateStore, err :=
-		certificate.NewFileStore(componentName, certDir, certDir, "", "")
+		store.NewFileStoreWrapper(componentName, certDir, certDir, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize the server certificate store: %v", err)
 	}
@@ -123,6 +142,7 @@ func newCertManager(
 		ClientFn: func(current *tls.Certificate) (clicert.CertificateSigningRequestInterface, error) {
 			return clientset.CertificatesV1beta1().CertificateSigningRequests(), nil
 		},
+		SignerName:  certificates.LegacyUnknownSignerName,
 		GetTemplate: getTemplate,
 		Usages: []certificates.KeyUsage{
 			certificates.UsageAny,

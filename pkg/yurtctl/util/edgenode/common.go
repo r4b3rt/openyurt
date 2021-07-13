@@ -32,7 +32,7 @@ const (
 	DaemonReload      = "systemctl daemon-reload"
 	RestartKubeletSvc = "systemctl restart kubelet"
 
-	ServerHealthzServer  = "127.0.0.1:10261"
+	ServerHealthzServer  = "127.0.0.1:10267"
 	ServerHealthzURLPath = "/v1/healthz"
 	OpenyurtKubeletConf  = `
 apiVersion: v1
@@ -68,6 +68,10 @@ spec:
     hostPath:
       path: /etc/kubernetes
       type: Directory
+  - name: pem-dir
+    hostPath:
+      path: /var/lib/kubelet/pki
+      type: Directory
   containers:
   - name: yurt-hub
     image: __yurthub_image__
@@ -77,6 +81,8 @@ spec:
       mountPath: /var/lib/yurthub
     - name: kubernetes
       mountPath: /etc/kubernetes
+    - name: pem-dir
+      mountPath: /var/lib/kubelet/pki
     command:
     - yurthub
     - --v=2

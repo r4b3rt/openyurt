@@ -22,11 +22,12 @@ const (
 
 	YurtctlLockConfigMapName = "yurtctl-lock"
 
-	YurttunnelServerComponentName = "yurt-tunnel-server"
-	YurttunnelServerSvcName       = "x-tunnel-server-svc"
-	YurttunnelServerCmName        = "yurt-tunnel-server-cfg"
-	YurttunnelAgentComponentName  = "yurt-tunnel-agent"
-	YurttunnelNamespace           = "kube-system"
+	YurttunnelServerComponentName   = "yurt-tunnel-server"
+	YurttunnelServerSvcName         = "x-tunnel-server-svc"
+	YurttunnelServerInternalSvcName = "x-tunnel-server-internal-svc"
+	YurttunnelServerCmName          = "yurt-tunnel-server-cfg"
+	YurttunnelAgentComponentName    = "yurt-tunnel-agent"
+	YurttunnelNamespace             = "kube-system"
 
 	YurtControllerManagerServiceAccount = `
 apiVersion: v1
@@ -142,6 +143,8 @@ spec:
     spec:
       serviceAccountName: yurt-controller-manager
       hostNetwork: true
+      tolerations:
+      - operator: "Exists"
       affinity:
         nodeAffinity:
           # we prefer allocating ecm on cloud node
@@ -186,7 +189,7 @@ spec:
         - /bin/sh
         - -c
         args:
-        - "cp /usr/local/bin/yurtctl /tmp && nsenter -t 1 -m -u -n -i -- /var/tmp/yurtctl convert edgenode --yurthub-image {{.yurthub_image}} --join-token {{.joinToken}} && rm /tmp/yurtctl"
+        - "cp /usr/local/bin/yurtctl /tmp && nsenter -t 1 -m -u -n -i -- /var/tmp/yurtctl convert edgenode --yurthub-image {{.yurthub_image}} {{if .yurthub_healthcheck_timeout}}--yurthub-healthcheck-timeout {{.yurthub_healthcheck_timeout}} {{end}}--join-token {{.joinToken}} && rm /tmp/yurtctl"
         securityContext:
           privileged: true
         volumeMounts:

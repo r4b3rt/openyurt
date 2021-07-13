@@ -17,17 +17,18 @@ limitations under the License.
 package constants
 
 const (
-	YurttunnelServerAgentPort          = "10262"
-	YurttunnelServerMasterPort         = "10263"
-	YurttunnelServerMasterInsecurePort = "10264"
-	YurttunnelServerMetaPort           = "10265"
-	YurttunnelAgentMetaPort            = "10266"
-	YurttunnelServerServiceNs          = "kube-system"
-	YurttunnelServerServiceName        = "x-tunnel-server-svc"
-	YurttunnelServerAgentPortName      = "tcp"
-	YurttunnelServerExternalAddrKey    = "x-tunnel-server-external-addr"
-	YurttunnelEndpointsNs              = "kube-system"
-	YurttunnelEndpointsName            = "x-tunnel-server-svc"
+	YurttunnelServerAgentPort           = "10262"
+	YurttunnelServerMasterPort          = "10263"
+	YurttunnelServerMasterInsecurePort  = "10264"
+	YurttunnelServerMetaPort            = "10265"
+	YurttunnelAgentMetaPort             = "10266"
+	YurttunnelServerServiceNs           = "kube-system"
+	YurttunnelServerInternalServiceName = "x-tunnel-server-internal-svc"
+	YurttunnelServerServiceName         = "x-tunnel-server-svc"
+	YurttunnelServerAgentPortName       = "tcp"
+	YurttunnelServerExternalAddrKey     = "x-tunnel-server-external-addr"
+	YurttunnelEndpointsNs               = "kube-system"
+	YurttunnelEndpointsName             = "x-tunnel-server-svc"
 
 	// yurttunnel PKI related constants
 	YurttunnelCSROrg                 = "openyurt:yurttunnel"
@@ -42,6 +43,9 @@ const (
 
 	// name of the environment variables used in pod
 	YurttunnelAgentPodIPEnv = "POD_IP"
+
+	// name of the environment for selecting backend agent used in yurt-tunnel-server
+	ProxyHostHeaderKey = "X-Tunnel-Proxy-Host"
 
 	// The timeout seconds of reading a complete request from the apiserver
 	YurttunnelANPInterceptorReadTimeoutSec = 10

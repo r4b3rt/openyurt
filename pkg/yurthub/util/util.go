@@ -43,6 +43,14 @@ import (
 type ProxyKeyType int
 
 const (
+	// YurtHubCertificateManagerName represents the certificateManager name in yurthub mode
+	YurtHubCertificateManagerName = "hubself"
+	// KubeletCertificateManagerName represents the certificateManager name in kubelet mode
+	KubeletCertificateManagerName = "kubelet"
+	// DefaultKubeletPairFilePath represents the default kubelet pair file path
+	DefaultKubeletPairFilePath = "/var/lib/kubelet/pki/kubelet-client-current.pem"
+	// DefaultKubeletRootCAFilePath represents the default kubelet ca file path
+	DefaultKubeletRootCAFilePath = "/etc/kubernetes/pki/ca.crt"
 	// ProxyReqContentType represents request content type context key
 	ProxyReqContentType ProxyKeyType = iota
 	// ProxyRespContentType represents response content type context key
@@ -135,34 +143,48 @@ func ReqInfoString(info *apirequest.RequestInfo) string {
 	return fmt.Sprintf("%s %s for %s", info.Verb, info.Resource, info.Path)
 }
 
-// WriteObject write object to response writer
-func WriteObject(statusCode int, obj runtime.Object, w http.ResponseWriter, req *http.Request) {
+// IsKubeletLeaseReq judge whether the request is a lease request from kubelet
+func IsKubeletLeaseReq(req *http.Request) bool {
 	ctx := req.Context()
-	gv := schema.GroupVersion{
-		Group:   "",
-		Version: runtime.APIVersionInternal,
+	if comp, ok := ClientComponentFrom(ctx); !ok || comp != "kubelet" {
+		return false
 	}
+	if info, ok := apirequest.RequestInfoFrom(ctx); !ok || info.Resource != "leases" {
+		return false
+	}
+	return true
+}
+
+// WriteObject write object to response writer
+func WriteObject(statusCode int, obj runtime.Object, w http.ResponseWriter, req *http.Request) error {
+	ctx := req.Context()
 	if info, ok := apirequest.RequestInfoFrom(ctx); ok {
-		gv.Group = info.APIGroup
-		gv.Version = info.APIVersion
+		gv := schema.GroupVersion{
+			Group:   info.APIGroup,
+			Version: info.APIVersion,
+		}
+		negotiatedSerializer := serializer.YurtHubSerializer.GetNegotiatedSerializer(gv.WithResource(info.Resource))
+		responsewriters.WriteObjectNegotiated(negotiatedSerializer, negotiation.DefaultEndpointRestrictions, gv, w, req, statusCode, obj)
+		return nil
 	}
 
-	responsewriters.WriteObjectNegotiated(serializer.YurtHubSerializer.NegotiatedSerializer, negotiation.DefaultEndpointRestrictions, gv, w, req, statusCode, obj)
+	return fmt.Errorf("request info is not found when write object, %s", ReqString(req))
 }
 
 // Err write err to response writer
 func Err(err error, w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
-	gv := schema.GroupVersion{
-		Group:   "",
-		Version: runtime.APIVersionInternal,
-	}
 	if info, ok := apirequest.RequestInfoFrom(ctx); ok {
-		gv.Group = info.APIGroup
-		gv.Version = info.APIVersion
+		gv := schema.GroupVersion{
+			Group:   info.APIGroup,
+			Version: info.APIVersion,
+		}
+		negotiatedSerializer := serializer.YurtHubSerializer.GetNegotiatedSerializer(gv.WithResource(info.Resource))
+		responsewriters.ErrorNegotiated(err, negotiatedSerializer, gv, w, req)
+		return
 	}
 
-	responsewriters.ErrorNegotiated(err, serializer.YurtHubSerializer.NegotiatedSerializer, gv, w, req)
+	klog.Errorf("request info is not found when err write, %s", ReqString(req))
 }
 
 // NewDualReadCloser create an dualReadCloser object
@@ -269,7 +291,7 @@ func IsSupportedLBMode(lbMode string) bool {
 // IsSupportedCertMode check cert mode is supported or not
 func IsSupportedCertMode(certMode string) bool {
 	switch certMode {
-	case "kubelet", "hubself":
+	case KubeletCertificateManagerName, YurtHubCertificateManagerName:
 		return true
 	}
 
@@ -287,24 +309,19 @@ func FileExists(filename string) (bool, error) {
 }
 
 // LoadKubeletRestClientConfig load *rest.Config for accessing healthyServer
-func LoadKubeletRestClientConfig(healthyServer *url.URL) (*rest.Config, error) {
-	const (
-		pairFile   = "/var/lib/kubelet/pki/kubelet-client-current.pem"
-		rootCAFile = "/etc/kubernetes/pki/ca.crt"
-	)
-
+func LoadKubeletRestClientConfig(healthyServer *url.URL, kubeletRootCAFilePath, kubeletPairFilePath string) (*rest.Config, error) {
 	tlsClientConfig := rest.TLSClientConfig{}
-	if _, err := certutil.NewPool(rootCAFile); err != nil {
-		klog.Errorf("Expected to load root CA config from %s, but got err: %v", rootCAFile, err)
+	if _, err := certutil.NewPool(kubeletRootCAFilePath); err != nil {
+		klog.Errorf("Expected to load root CA config from %s, but got err: %v", kubeletRootCAFilePath, err)
 	} else {
-		tlsClientConfig.CAFile = rootCAFile
+		tlsClientConfig.CAFile = kubeletRootCAFilePath
 	}
 
-	if can, _ := certutil.CanReadCertAndKey(pairFile, pairFile); !can {
-		return nil, fmt.Errorf("error reading %s, certificate and key must be supplied as a pair", pairFile)
+	if can, _ := certutil.CanReadCertAndKey(kubeletPairFilePath, kubeletPairFilePath); !can {
+		return nil, fmt.Errorf("error reading %s, certificate and key must be supplied as a pair", kubeletPairFilePath)
 	}
-	tlsClientConfig.KeyFile = pairFile
-	tlsClientConfig.CertFile = pairFile
+	tlsClientConfig.KeyFile = kubeletPairFilePath
+	tlsClientConfig.CertFile = kubeletPairFilePath
 
 	return &rest.Config{
 		Host:            healthyServer.String(),

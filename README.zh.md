@@ -4,10 +4,9 @@
 
 <img src="docs/img/OpenYurt.png" width="400" height="94"><br/>
 
-[![Version](https://img.shields.io/badge/OpenYurt-v0.3.0-orange)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/OpenYurt-v0.4.0-orange)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-Apache%202-4EB1BA.svg)](https://www.apache.org/licenses/LICENSE-2.0.html)
 [![Go Report Card](https://goreportcard.com/badge/github.com/openyurtio/openyurt)](https://goreportcard.com/report/github.com/openyurtio/openyurt)
-[![Build Status](https://travis-ci.org/openyurtio/openyurt.svg?branch=master)](https://travis-ci.org/openyurtio/openyurt)
 
 </div>
 
@@ -15,6 +14,7 @@
 
 |![notification](docs/img/bell-outline-badge.svg) What is NEW!|
 |------------------|
+| 2021-05-21  OpenYurt v0.4.0  **正式发布**! 请查看 [CHANGELOG](CHANGELOG.md) 来获得更多更新细节.|
 | 2021-01-08  OpenYurt v0.3.0  **正式发布**! 请查看 [CHANGELOG](CHANGELOG.md) 来获得更多更新细节.|
 | 2020-08-30  OpenYurt v0.2.0  **正式发布**! 请查看 [CHANGELOG](CHANGELOG.md) 来获得更多更新细节.|
 | 2020-05-29  OpenYurt v0.1.0-beta.1  **正式发布**! 请查看 [CHANGELOG](CHANGELOG.md) 来获得更多更新细节.|
@@ -48,8 +48,12 @@ OpenYurt 的主要组件包括：
 后者定义了一种新的边缘应用模型以节点池为单位来管理工作负载。
 - **Yurt Tunnel (server/agent)**：`TunnelServer`通过反向代理与在每个边缘节点中运行的 TunnelAgent 守护进程建立连接并以此在公共云的控制平面 与 处于 企业内网（ Intranet ）环境的边缘节点之间建立安全的网络访问。
 
+## 开始之前
+
+[资源和系统要求](./docs/resource-and-system-requirements-cn.md)
+
 ## 开始使用
-OpenYurt 支持最高版本为1.16的 Kubernetes 。使用更高版本的 Kubernetes 可能会导致兼容性问题。
+OpenYurt 支持最高版本为1.18的 Kubernetes 。使用更高版本的 Kubernetes 可能会导致兼容性问题。
 您可以[手动](docs/tutorial/manually-setup.md)设置 OpenYurt 集群，但是我们建议使用 `yurtctl` 命令行工具启动 OpenYurt 。要快速构建和安装设置 `yurtctl` ，在编译系统已安装了 golang 1.13+ 和 bash 的前提下你可以执行以下命令来完成安装：
 
 ```bash
@@ -95,11 +99,11 @@ _output/bin/yurtctl revert
 如果您对本项目有任何疑问或想做出贡献，欢迎通过 github issue 或 pull request 来沟通相关问题，其他有效的沟通渠道如下所示：
 
 - 邮件组: https://groups.google.com/g/openyurt/
-- Slack: [channel](https://openyurt.slack.com/)
+- Slack: [channel](https://join.slack.com/t/openyurt/shared_invite/zt-rc5ecz4h-sEWU1vYx5gzc3_zx3En0jg)
 - Dingtalk Group (钉钉讨论群)
 
 <div align="left">
-  <img src="docs/img/ding.jpeg" width=25% title="dingtalk">
+  <img src="docs/img/ding.jpg" width=25% title="dingtalk">
 </div>
 
 ## 许可证

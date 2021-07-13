@@ -49,9 +49,7 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - services
   - endpoints
-  - configmaps
   verbs:
   - get
 - apiGroups:
@@ -61,6 +59,32 @@ rules:
   verbs:
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - list
+  - watch
+  - get
+  - create
+  - update
+- apiGroups:
+  - "coordination.k8s.io"
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update
 `
 	YurttunnelServerServiceAccount = `
 apiVersion: v1
@@ -103,6 +127,26 @@ spec:
   selector:
     k8s-app: yurt-tunnel-server
 `
+	YurttunnelServerInternalService = `
+apiVersion: v1
+kind: Service
+metadata:
+  name: x-tunnel-server-internal-svc
+  namespace: kube-system
+  labels:
+    name: yurt-tunnel-server
+spec:
+  ports:
+    - port: 10250
+      targetPort: 10263
+      name: https
+    - port: 10255
+      targetPort: 10264
+      name: http
+  selector:
+    k8s-app: yurt-tunnel-server
+`
+
 	YurttunnelServerConfigMap = `
 apiVersion: v1
 kind: ConfigMap
@@ -152,6 +196,7 @@ spec:
         - yurt-tunnel-server
         args:
         - --bind-address=$(NODE_IP)
+        - --insecure-bind-address=$(NODE_IP)
         - --server-count=1
         env:
         - name: NODE_IP

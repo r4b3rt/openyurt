@@ -4,10 +4,9 @@
 
 <img src="docs/img/OpenYurt.png" width="400" height="94"><br/>
 
-[![Version](https://img.shields.io/badge/OpenYurt-v0.3.0-orange)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/OpenYurt-v0.4.0-orange)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-Apache%202-4EB1BA.svg)](https://www.apache.org/licenses/LICENSE-2.0.html)
 [![Go Report Card](https://goreportcard.com/badge/github.com/openyurtio/openyurt)](https://goreportcard.com/report/github.com/openyurtio/openyurt)
-[![Build Status](https://travis-ci.org/openyurtio/openyurt.svg?branch=master)](https://travis-ci.org/openyurtio/openyurt)
 
 </div>
 
@@ -15,6 +14,7 @@ English | [简体中文](./README.zh.md)
 
 |![notification](docs/img/bell-outline-badge.svg) What is NEW!|
 |------------------|
+|March 21th, 2021. OpenYurt v0.4.0 is **RELEASED**! Please check the [CHANGELOG](CHANGELOG.md) for details.|
 |January 8th, 2021. OpenYurt v0.3.0 is **RELEASED**! Please check the [CHANGELOG](CHANGELOG.md) for details.|
 |August 30th, 2020. OpenYurt v0.2.0 is **RELEASED**! Please check the [CHANGELOG](CHANGELOG.md) for details.|
 |May 29th, 2020. OpenYurt v0.1.0-beta.1 is **RELEASED**! Please check the [CHANGELOG](CHANGELOG.md) for details.|
@@ -67,10 +67,17 @@ The major OpenYurt components consist of:
 - **Yurt tunnel (server/agent)**: `TunnelServer` connects with the `TunnelAgent` daemon running in each edge node via a
   reverse proxy to establish a secure network access between the cloud site control plane and the edge nodes
   that are connected to the intranet.
+- **Node resource manager**: It manages local node resources of OpenYurt cluster in a unified manner.
+  It currently manages LVM, QuotaPath and Pmem Memory.
+  Please refer to [node-resource-manager](https://github.com/openyurtio/node-resource-manager) for more details.
+
+## Before you begin
+
+[Resource and system requirements](./docs/resource-and-system-requirements.md)
 
 ## Getting started
 
-OpenYurt supports Kubernetes versions up to 1.16. Using higher Kubernetes versions may cause
+OpenYurt supports Kubernetes versions up to 1.18. Using higher Kubernetes versions may cause
 compatibility issues.
 
 You can setup the OpenYurt cluster [manually](docs/tutorial/manually-setup.md), but we recommend to start
@@ -128,11 +135,11 @@ If you have any questions or want to contribute, you are welcome to communicate 
 Other active communication channels:
 
 - Mailing List: https://groups.google.com/g/openyurt/
-- Slack: [channel](https://openyurt.slack.com/)
+- Slack: [channel](https://join.slack.com/t/openyurt/shared_invite/zt-rc5ecz4h-sEWU1vYx5gzc3_zx3En0jg)
 - Dingtalk Group (钉钉讨论群)
 
 <div align="left">
-  <img src="docs/img/ding.jpeg" width=25% title="dingtalk">
+  <img src="docs/img/ding.jpg" width=25% title="dingtalk">
 </div>
 
 ## License

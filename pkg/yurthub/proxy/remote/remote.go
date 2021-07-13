@@ -64,6 +64,7 @@ func NewRemoteProxy(remoteServer *url.URL,
 	proxyBackend.reverseProxy.Transport = currentTransport
 	proxyBackend.reverseProxy.ModifyResponse = proxyBackend.modifyResponse
 	proxyBackend.reverseProxy.FlushInterval = -1
+	proxyBackend.reverseProxy.ErrorHandler = proxyBackend.errorHandler
 
 	return proxyBackend, nil
 }
@@ -105,23 +106,43 @@ func (rp *RemoteProxy) modifyResponse(resp *http.Response) error {
 	// cache resp with storage interface
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode <= http.StatusPartialContent {
 		if rp.cacheMgr.CanCacheFor(req) {
-			respContentType := resp.Header.Get("Content-Type")
-			ctx = util.WithRespContentType(ctx, respContentType)
 			reqContentType, _ := util.ReqContentTypeFrom(ctx)
-			if len(reqContentType) == 0 || reqContentType == "*/*" {
-				ctx = util.WithReqContentType(ctx, respContentType)
+			respContentType := resp.Header.Get("Content-Type")
+			if len(respContentType) == 0 {
+				respContentType = reqContentType
 			}
+			ctx = util.WithRespContentType(ctx, respContentType)
+			req = req.WithContext(ctx)
 
 			rc, prc := util.NewDualReadCloser(resp.Body, true)
-			go func(ctx context.Context, prc io.ReadCloser, stopCh <-chan struct{}) {
-				err := rp.cacheMgr.CacheResponse(ctx, prc, stopCh)
+			go func(req *http.Request, prc io.ReadCloser, stopCh <-chan struct{}) {
+				err := rp.cacheMgr.CacheResponse(req, prc, stopCh)
 				if err != nil && err != io.EOF && err != context.Canceled {
 					klog.Errorf("%s response cache ended with error, %v", util.ReqString(req), err)
 				}
-			}(ctx, prc, rp.stopCh)
+			}(req, prc, rp.stopCh)
 
 			resp.Body = rc
 		}
 	}
 	return nil
+}
+
+func (rp *RemoteProxy) errorHandler(rw http.ResponseWriter, req *http.Request, err error) {
+	klog.V(2).Infof("remote proxy error handler: %s, %v", util.ReqString(req), err)
+	if !rp.cacheMgr.CanCacheFor(req) {
+		rw.WriteHeader(http.StatusBadGateway)
+		return
+	}
+
+	ctx := req.Context()
+	if info, ok := apirequest.RequestInfoFrom(ctx); ok {
+		if info.Verb == "get" || info.Verb == "list" {
+			if obj, err := rp.cacheMgr.QueryCache(req); err == nil {
+				util.WriteObject(http.StatusOK, obj, rw, req)
+				return
+			}
+		}
+	}
+	rw.WriteHeader(http.StatusBadGateway)
 }
