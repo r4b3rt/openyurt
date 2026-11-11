@@ -18,190 +18,198 @@ package transport
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"net/url"
 	"time"
 
-	"github.com/openyurtio/openyurt/pkg/yurthub/certificate/interfaces"
-	"github.com/openyurtio/openyurt/pkg/yurthub/util"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+
+	"github.com/openyurtio/openyurt/pkg/util/certmanager"
+	"github.com/openyurtio/openyurt/pkg/yurthub/util"
 )
 
-const (
-	deaultHealthzTimeoutSeconds = 2
-)
+type CertGetter interface {
+	// GetAPIServerClientCert returns the currently selected certificate, as well as
+	// the associated certificate and key data in PEM format.
+	GetAPIServerClientCert() *tls.Certificate
+	// GetCAData returns CA file data.
+	GetCAData() []byte
+}
 
 // Interface is an transport interface for managing clients that used to connecting kube-apiserver
 type Interface interface {
-	// HealthzHTTPClient returns http client that used by health checker
-	HealthzHTTPClient() *http.Client
-	// concurrent use by multiple goroutines
 	// CurrentTransport get transport that used by load balancer
-	CurrentTransport() *http.Transport
-	// GetRestClientConfig get rest config that used by gc
-	GetRestClientConfig() *rest.Config
-	// UpdateTransport update secure transport manager with certificate manager
-	UpdateTransport(certMgr interfaces.YurtCertificateManager) error
-	// close all net connections that specified by address
+	// and can be used by multiple goroutines concurrently.
+	CurrentTransport() http.RoundTripper
+	// BearerTransport returns transport for proxying request with bearer token in header
+	BearerTransport() http.RoundTripper
+	// Close all net connections that specified by address
 	Close(address string)
+	// GetDirectClientset returns clientset specified by url
+	GetDirectClientset(url *url.URL) kubernetes.Interface
+	// GetDirectClientsetAtRandom returns a clientset at random
+	GetDirectClientsetAtRandom() kubernetes.Interface
+	// ListDirectClientset returns all clientsets
+	ListDirectClientset() map[string]kubernetes.Interface
 }
 
-type transportManager struct {
-	dialer            *util.Dialer
-	healthzHTTPClient *http.Client
+type transportAndClientManager struct {
 	currentTransport  *http.Transport
-	certManager       interfaces.YurtCertificateManager
+	bearerTransport   *http.Transport
+	certGetter        CertGetter
 	closeAll          func()
 	close             func(string)
 	stopCh            <-chan struct{}
+	serverToClientset map[string]kubernetes.Interface
 }
 
-// NewTransportManager create an transport interface object.
-func NewTransportManager(heartbeatTimeoutSeconds int, stopCh <-chan struct{}) (Interface, error) {
+// NewTransportManager create a transport interface object.
+func NewTransportAndClientManager(servers []*url.URL, timeout int, certGetter CertGetter, stopCh <-chan struct{}) (Interface, error) {
+	caData := certGetter.GetCAData()
+	if len(caData) == 0 {
+		return nil, fmt.Errorf("ca cert data was not prepared when new transport")
+	}
+
+	cfg, err := tlsConfig(certGetter.GetAPIServerClientCert, caData)
+	if err != nil {
+		klog.Errorf("could not get tls config when new transport, %v", err)
+		return nil, err
+	}
+
 	d := util.NewDialer("transport manager")
 	t := utilnet.SetTransportDefaults(&http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		TLSHandshakeTimeout: 10 * time.Second,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:     cfg,
 		MaxIdleConnsPerHost: 25,
 		DialContext:         d.DialContext,
 	})
 
-	if heartbeatTimeoutSeconds == 0 {
-		heartbeatTimeoutSeconds = deaultHealthzTimeoutSeconds
-	}
-
-	tm := &transportManager{
-		healthzHTTPClient: &http.Client{
-			Transport: t,
-			Timeout:   time.Duration(heartbeatTimeoutSeconds) * time.Second,
-		},
-		dialer:   d,
-		closeAll: d.CloseAll,
-		close:    d.Close,
-		stopCh:   stopCh,
-	}
-
-	return tm, nil
-}
-
-// UpdateTransport used to update ca file and tls config
-func (tm *transportManager) UpdateTransport(certMgr interfaces.YurtCertificateManager) error {
-	caFile := certMgr.GetCaFile()
-	if len(caFile) == 0 {
-		return fmt.Errorf("ca cert file was not prepared when update tranport")
-	}
-	klog.V(2).Infof("use %s ca cert file to access remote server", caFile)
-
-	cfg, err := tlsConfig(certMgr, caFile)
+	bearerTLSCfg, err := tlsConfig(nil, caData)
 	if err != nil {
-		klog.Errorf("could not get tls config when update transport, %v", err)
-		return err
+		klog.Errorf("could not get tls config when new bearer transport, %v", err)
+		return nil, err
 	}
 
-	tm.currentTransport = utilnet.SetTransportDefaults(&http.Transport{
+	bt := utilnet.SetTransportDefaults(&http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		TLSHandshakeTimeout: 10 * time.Second,
-		TLSClientConfig:     cfg,
+		TLSClientConfig:     bearerTLSCfg,
 		MaxIdleConnsPerHost: 25,
-		DialContext:         tm.dialer.DialContext,
+		DialContext:         d.DialContext,
 	})
-	tm.certManager = certMgr
 
-	tm.start()
+	tcm := &transportAndClientManager{
+		currentTransport:  t,
+		bearerTransport:   bt,
+		certGetter:        certGetter,
+		closeAll:          d.CloseAll,
+		close:             d.Close,
+		stopCh:            stopCh,
+		serverToClientset: make(map[string]kubernetes.Interface),
+	}
+
+	for i := range servers {
+		config := &rest.Config{
+			Host:      servers[i].String(),
+			Transport: t,
+			Timeout:   time.Duration(timeout) * time.Second,
+		}
+
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(servers[i].String()) != 0 {
+			tcm.serverToClientset[servers[i].String()] = clientset
+		}
+	}
+
+	tcm.start()
+
+	return tcm, nil
+}
+
+func (tcm *transportAndClientManager) CurrentTransport() http.RoundTripper {
+	return tcm.currentTransport
+}
+
+func (tcm *transportAndClientManager) BearerTransport() http.RoundTripper {
+	return tcm.bearerTransport
+}
+
+func (tcm *transportAndClientManager) Close(address string) {
+	tcm.close(address)
+}
+
+func (tcm *transportAndClientManager) GetDirectClientset(url *url.URL) kubernetes.Interface {
+	if url != nil {
+		return tcm.serverToClientset[url.String()]
+	}
 	return nil
 }
 
-func (tm *transportManager) HealthzHTTPClient() *http.Client {
-	return tm.healthzHTTPClient
+func (tcm *transportAndClientManager) GetDirectClientsetAtRandom() kubernetes.Interface {
+	// iterating map uses random order
+	for server := range tcm.serverToClientset {
+		return tcm.serverToClientset[server]
+	}
+
+	return nil
 }
 
-func (tm *transportManager) GetRestClientConfig() *rest.Config {
-	return tm.certManager.GetRestConfig()
+func (tcm *transportAndClientManager) ListDirectClientset() map[string]kubernetes.Interface {
+	return tcm.serverToClientset
 }
 
-func (tm *transportManager) CurrentTransport() *http.Transport {
-	return tm.currentTransport
-}
-
-func (tm *transportManager) Close(address string) {
-	tm.close(address)
-}
-
-func (tm *transportManager) start() {
-	lastCert := tm.certManager.Current()
+func (tcm *transportAndClientManager) start() {
+	lastCert := tcm.certGetter.GetAPIServerClientCert()
 
 	go wait.Until(func() {
-		curr := tm.certManager.Current()
+		curr := tcm.certGetter.GetAPIServerClientCert()
 
 		if lastCert == nil && curr == nil {
 			// maybe at yurthub startup, just wait for cert generated, do nothing
 		} else if lastCert == nil && curr != nil {
 			// cert generated, close all client connections for load new cert
 			klog.Infof("new cert generated, so close all client connections for loading new cert")
-			tm.closeAll()
+			tcm.closeAll()
 			lastCert = curr
 		} else if lastCert != nil && curr != nil {
 			if lastCert == curr {
 				// cert is not rotate, just wait
+				klog.V(5).Infof("cert is not rotate, just wait")
 			} else {
 				// cert rotated
 				klog.Infof("cert rotated, so close all client connections for loading new cert")
-				tm.closeAll()
+				tcm.closeAll()
 				lastCert = curr
 			}
 		} else {
 			// lastCet != nil && curr == nil
 			// certificate expired or deleted unintentionally, just wait for cert updated by bootstrap config, do nothing
+			klog.Warningf("certificate expired or deleted unintentionally")
 		}
-	}, 10*time.Second, tm.stopCh)
+	}, 10*time.Second, tcm.stopCh)
 }
 
-func tlsConfig(certMgr interfaces.YurtCertificateManager, caFile string) (*tls.Config, error) {
-	root, err := rootCertPool(caFile)
+func tlsConfig(current func() *tls.Certificate, caData []byte) (*tls.Config, error) {
+	// generate the TLS configuration based on the latest certificate
+	rootCert, err := certmanager.GenCertPoolUseCAData(caData)
+	if err != nil {
+		klog.Errorf("could not generate a x509 CertPool based on the given CA file, %v", err)
+		return nil, err
+	}
+	tlsCfg, err := certmanager.GenTLSConfigUseCurrentCertAndCertPool(current, rootCert, "client")
 	if err != nil {
 		return nil, err
 	}
 
-	tlsConfig := &tls.Config{
-		// Can't use SSLv3 because of POODLE and BEAST
-		// Can't use TLSv1.0 because of POODLE and BEAST using CBC cipher
-		// Can't use TLSv1.1 because of RC4 cipher usage
-		MinVersion: tls.VersionTLS12,
-		RootCAs:    root,
-	}
-
-	tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-		cert := certMgr.Current()
-		if cert == nil {
-			return &tls.Certificate{Certificate: nil}, nil
-		}
-		return cert, nil
-	}
-
-	return tlsConfig, nil
-}
-
-func rootCertPool(caFile string) (*x509.CertPool, error) {
-	if len(caFile) > 0 {
-		if caFileExists, err := util.FileExists(caFile); err != nil {
-			return nil, err
-		} else if caFileExists {
-			caData, err := ioutil.ReadFile(caFile)
-			if err != nil {
-				return nil, err
-			}
-
-			certPool := x509.NewCertPool()
-			certPool.AppendCertsFromPEM(caData)
-			return certPool, nil
-		}
-	}
-
-	return nil, fmt.Errorf("failed to load ca file(%s)", caFile)
+	return tlsCfg, nil
 }

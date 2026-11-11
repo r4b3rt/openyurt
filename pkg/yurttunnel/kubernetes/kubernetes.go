@@ -19,7 +19,6 @@ package kubernetes
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"k8s.io/client-go/kubernetes"
@@ -32,7 +31,7 @@ import (
 )
 
 // CreateClientSet creates a clientset based on the given kubeConfig. If the
-// kubeConfig is empty, it will creates the clientset based on the in-cluster
+// kubeConfig is empty, it will create the clientset based on the in-cluster
 // config
 func CreateClientSet(kubeConfig string) (*kubernetes.Clientset, error) {
 
@@ -57,7 +56,7 @@ func CreateClientSetKubeConfig(kubeConfig string) (*kubernetes.Clientset, error)
 	}
 	cfg, err = clientcmd.BuildConfigFromFlags("", kubeConfig)
 	if err != nil {
-		return nil, fmt.Errorf("fail to create the clientset based on %s: %v",
+		return nil, fmt.Errorf("could not create the clientset based on %s: %w",
 			kubeConfig, err)
 	}
 	cliSet, err := kubernetes.NewForConfig(cfg)
@@ -75,7 +74,7 @@ func CreateClientSetApiserverAddr(apiserverAddr string) (*kubernetes.Clientset, 
 		return nil, errors.New("apiserver addr can't be empty")
 	}
 
-	token, err := ioutil.ReadFile(constants.YurttunnelTokenFile)
+	token, err := os.ReadFile(constants.YurttunnelTokenFile)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +89,7 @@ func CreateClientSetApiserverAddr(apiserverAddr string) (*kubernetes.Clientset, 
 	}
 
 	restConfig := rest.Config{
-		Host:            "https://" + apiserverAddr,
+		Host:            constants.HTTPSPrefix + apiserverAddr,
 		TLSClientConfig: tlsClientConfig,
 		BearerToken:     string(token),
 		BearerTokenFile: constants.YurttunnelTokenFile,

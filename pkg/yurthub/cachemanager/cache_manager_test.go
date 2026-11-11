@@ -18,21 +18,17 @@ package cachemanager
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/serializer"
-	proxyutil "github.com/openyurtio/openyurt/pkg/yurthub/proxy/util"
-	"github.com/openyurtio/openyurt/pkg/yurthub/storage"
-	"github.com/openyurtio/openyurt/pkg/yurthub/storage/disk"
-	"github.com/openyurtio/openyurt/pkg/yurthub/util"
 
 	v1 "k8s.io/api/core/v1"
 	nodev1beta1 "k8s.io/api/node/v1beta1"
@@ -40,13 +36,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
-	runtimejson "k8s.io/apimachinery/pkg/runtime/serializer/json"
-	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/endpoints/filters"
+	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
-	restclientwatch "k8s.io/client-go/rest/watch"
+	"k8s.io/client-go/tools/cache"
+
+	"github.com/openyurtio/openyurt/pkg/projectinfo"
+	"github.com/openyurtio/openyurt/pkg/yurthub/configuration"
+	hubmeta "github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/meta"
+	"github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/serializer"
+	proxyutil "github.com/openyurtio/openyurt/pkg/yurthub/proxy/util"
+	"github.com/openyurtio/openyurt/pkg/yurthub/storage"
+	"github.com/openyurtio/openyurt/pkg/yurthub/storage/disk"
+	"github.com/openyurtio/openyurt/pkg/yurthub/util"
 )
 
 var (
@@ -54,43 +61,36 @@ var (
 )
 
 func TestCacheGetResponse(t *testing.T) {
-	//storage := NewFakeStorageWrapper()
 	dStorage, err := disk.NewDiskStorage(rootDir)
 	if err != nil {
 		t.Errorf("failed to create disk storage, %v", err)
 	}
+	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(rootDir)
+	if err != nil {
+		t.Errorf("failed to create RESTMapper manager, %v", err)
+	}
 	sWrapper := NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	yurtCM := &cacheManager{
-		storage:           sWrapper,
-		serializerManager: serializerM,
-		cacheAgents:       make(map[string]bool),
-	}
+
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	yurtCM := NewCacheManager(sWrapper, serializerM, restRESTMapperMgr, configManager)
 
 	testcases := map[string]struct {
-		group        string
-		version      string
-		key          string
 		inputObj     runtime.Object
-		userAgent    string
-		accept       string
+		header       map[string]string
 		verb         string
 		path         string
-		resource     string
-		namespaced   bool
 		expectResult struct {
-			err  bool
+			err  error
 			rv   string
 			name string
 			ns   string
 			kind string
 		}
-		cacheErr error
+		cacheResponseErr bool
 	}{
-		"cache response for get pod": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/pods/default/mypod1",
+		"cache response for pod with not assigned node": {
 			inputObj: runtime.Object(&v1.Pod{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -102,14 +102,37 @@ func TestCacheGetResponse(t *testing.T) {
 					ResourceVersion: "1",
 				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods/mypod1",
-			resource:   "pods",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb:             "GET",
+			path:             "/api/v1/namespaces/default/pods/mypod1",
+			cacheResponseErr: true,
+		},
+		"cache response for get pod": {
+			inputObj: runtime.Object(&v1.Pod{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "v1",
+					Kind:       "Pod",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "mypod1",
+					Namespace:       "default",
+					ResourceVersion: "1",
+				},
+				Spec: v1.PodSpec{
+					NodeName: "node1",
+				},
+			}),
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods/mypod1",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -122,9 +145,6 @@ func TestCacheGetResponse(t *testing.T) {
 			},
 		},
 		"cache response for get pod2": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/pods/default/mypod2",
 			inputObj: runtime.Object(&v1.Pod{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -135,15 +155,18 @@ func TestCacheGetResponse(t *testing.T) {
 					Namespace:       "default",
 					ResourceVersion: "3",
 				},
+				Spec: v1.PodSpec{
+					NodeName: "node1",
+				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods/mypod2",
-			resource:   "pods",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods/mypod2",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -156,9 +179,6 @@ func TestCacheGetResponse(t *testing.T) {
 			},
 		},
 		"cache response for get node": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/nodes/mynode1",
 			inputObj: runtime.Object(&v1.Node{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -169,14 +189,14 @@ func TestCacheGetResponse(t *testing.T) {
 					ResourceVersion: "4",
 				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/nodes/mynode1",
-			resource:   "nodes",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes/mynode1",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -188,9 +208,6 @@ func TestCacheGetResponse(t *testing.T) {
 			},
 		},
 		"cache response for get node2": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/nodes/mynode2",
 			inputObj: runtime.Object(&v1.Node{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -201,14 +218,14 @@ func TestCacheGetResponse(t *testing.T) {
 					ResourceVersion: "6",
 				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/nodes/mynode2",
-			resource:   "nodes",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes/mynode2",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -221,9 +238,6 @@ func TestCacheGetResponse(t *testing.T) {
 		},
 		//used to test whether custom resources can be cached correctly
 		"cache response for get crontab": {
-			group:   "stable.example.com",
-			version: "v1",
-			key:     "kubelet/crontabs/default/crontab1",
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "stable.example.com/v1",
@@ -235,14 +249,14 @@ func TestCacheGetResponse(t *testing.T) {
 					},
 				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs/crontab1",
-			resource:   "crontabs",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs/crontab1",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -255,9 +269,6 @@ func TestCacheGetResponse(t *testing.T) {
 			},
 		},
 		"cache response for get crontab2": {
-			group:   "stable.example.com",
-			version: "v1",
-			key:     "kubelet/crontabs/default/crontab2",
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "stable.example.com/v1",
@@ -269,14 +280,14 @@ func TestCacheGetResponse(t *testing.T) {
 					},
 				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs/crontab2",
-			resource:   "crontabs",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs/crontab2",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -289,9 +300,6 @@ func TestCacheGetResponse(t *testing.T) {
 			},
 		},
 		"cache response for get foo without namespace": {
-			group:   "samplecontroller.k8s.io",
-			version: "v1",
-			key:     "kubelet/foos/foo1",
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "samplecontroller.k8s.io/v1",
@@ -302,14 +310,14 @@ func TestCacheGetResponse(t *testing.T) {
 					},
 				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/samplecontroller.k8s.io/v1/foos/foo1",
-			resource:   "foos",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/samplecontroller.k8s.io/v1/foos/foo1",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -321,9 +329,6 @@ func TestCacheGetResponse(t *testing.T) {
 			},
 		},
 		"cache response for get foo2 without namespace": {
-			group:   "samplecontroller.k8s.io",
-			version: "v1",
-			key:     "kubelet/foos/foo2",
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "samplecontroller.k8s.io/v1",
@@ -334,14 +339,14 @@ func TestCacheGetResponse(t *testing.T) {
 					},
 				},
 			}),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/samplecontroller.k8s.io/v1/foos/foo2",
-			resource:   "foos",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/samplecontroller.k8s.io/v1/foos/foo2",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
@@ -353,9 +358,6 @@ func TestCacheGetResponse(t *testing.T) {
 			},
 		},
 		"cache response for Status": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/nodes/test",
 			inputObj: runtime.Object(&metav1.Status{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -366,31 +368,89 @@ func TestCacheGetResponse(t *testing.T) {
 				Reason:  "NotFound",
 				Code:    404,
 			}),
-			userAgent: "kubelet",
-			accept:    "application/json",
-			verb:      "GET",
-			path:      "/api/v1/nodes/test",
-			resource:  "nodes",
-			cacheErr:  storage.ErrStorageNotFound,
-		},
-		"cache response for nil object": {
-			group:     "",
-			version:   "v1",
-			key:       "kubelet/nodes/test",
-			inputObj:  nil,
-			userAgent: "kubelet",
-			accept:    "application/json",
-			verb:      "GET",
-			path:      "/api/v1/nodes/test",
-			resource:  "nodes",
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes/test",
 			expectResult: struct {
-				err  bool
+				err  error
 				rv   string
 				name string
 				ns   string
 				kind string
 			}{
-				err: true,
+				err: storage.ErrStorageNotFound,
+			},
+		},
+		"cache response for nil object": {
+			inputObj: nil,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb:             "GET",
+			path:             "/api/v1/nodes/test",
+			cacheResponseErr: true,
+		},
+		"cache response for get namespace": {
+			inputObj: runtime.Object(&v1.Namespace{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "v1",
+					Kind:       "Namespace",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "kube-system",
+					ResourceVersion: "1",
+				},
+			}),
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/kube-system",
+			expectResult: struct {
+				err  error
+				rv   string
+				name string
+				ns   string
+				kind string
+			}{
+				rv:   "1",
+				name: "kube-system",
+				kind: "Namespace",
+			},
+		},
+		"cache response for partial object metadata request": {
+			inputObj: runtime.Object(&metav1.PartialObjectMetadata{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "meta.k8s.io/v1",
+					Kind:       "PartialObjectMetadata",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "nodepools.apps.openyurt.io",
+					ResourceVersion: "738",
+					UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab900",
+				},
+			}),
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+			},
+			verb: "GET",
+			path: "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/nodepools.apps.openyurt.io",
+			expectResult: struct {
+				err  error
+				rv   string
+				name string
+				ns   string
+				kind string
+			}{
+				rv:   "738",
+				name: "nodepools.apps.openyurt.io",
+				kind: "PartialObjectMetadata",
 			},
 		},
 	}
@@ -399,55 +459,87 @@ func TestCacheGetResponse(t *testing.T) {
 	resolver := newTestRequestInfoResolver()
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
-			encoder, err := serializerM.CreateSerializers(tt.accept, tt.group, tt.version, tt.resource)
-			if err != nil {
-				t.Fatalf("could not create serializer, %v", err)
-			}
-
-			buf := bytes.NewBuffer([]byte{})
-			if tt.inputObj != nil {
-				err = encoder.Encoder.Encode(tt.inputObj, buf)
-				if err != nil {
-					t.Fatalf("could not encode input object, %v", err)
-				}
-			}
-
 			req, _ := http.NewRequest(tt.verb, tt.path, nil)
-			if len(tt.userAgent) != 0 {
-				req.Header.Set("User-Agent", tt.userAgent)
-			}
-
-			if len(tt.accept) != 0 {
-				req.Header.Set("Accept", tt.accept)
+			for k, v := range tt.header {
+				req.Header.Set(k, v)
 			}
 			req.RemoteAddr = "127.0.0.1"
 
+			var cacheErr error
+			var info *request.RequestInfo
+			var comp string
 			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				ctx := req.Context()
-				ctx = util.WithRespContentType(ctx, tt.accept)
-				prc := ioutil.NopCloser(buf)
-				err = yurtCM.CacheResponse(ctx, prc, nil)
+				info, _ = request.RequestInfoFrom(ctx)
+				// get component
+				comp, _ = util.TruncatedClientComponentFrom(ctx)
+
+				// inject response content type by request content type
+				reqContentType, _ := util.ReqContentTypeFrom(ctx)
+				ctx = util.WithRespContentType(ctx, reqContentType)
+				req = req.WithContext(ctx)
+
+				// build response body
+				gvr := schema.GroupVersionResource{
+					Group:    info.APIGroup,
+					Version:  info.APIVersion,
+					Resource: info.Resource,
+				}
+
+				convertGVK, ok := util.ConvertGVKFrom(ctx)
+				if ok && convertGVK != nil {
+					gvr, _ = meta.UnsafeGuessKindToResource(*convertGVK)
+					comp = util.AttachConvertGVK(comp, convertGVK)
+				}
+
+				s := serializerM.CreateSerializer(reqContentType, gvr.Group, gvr.Version, gvr.Resource)
+				encoder, err := s.Encoder(reqContentType, nil)
+				if err != nil {
+					t.Fatalf("could not create encoder, %v", err)
+				}
+				buf := bytes.NewBuffer([]byte{})
+				if tt.inputObj != nil {
+					err = encoder.Encode(tt.inputObj, buf)
+					if err != nil {
+						t.Fatalf("could not encode input object, %v", err)
+					}
+				}
+				prc := io.NopCloser(buf)
+				cacheErr = yurtCM.CacheResponse(req, prc, nil)
 			})
 
 			handler = proxyutil.WithRequestContentType(handler)
 			handler = proxyutil.WithRequestClientComponent(handler)
+			handler = proxyutil.WithPartialObjectMetadataRequest(handler)
 			handler = filters.WithRequestInfo(handler, resolver)
 			handler.ServeHTTP(httptest.NewRecorder(), req)
 
-			if tt.expectResult.err && err == nil {
+			if tt.cacheResponseErr && cacheErr == nil {
 				t.Errorf("expect err, but do not get error")
-			}
-
-			if len(tt.expectResult.name) == 0 {
+			} else if !tt.cacheResponseErr && cacheErr != nil {
+				t.Errorf("expect no err, but got error %v", err)
+			} else if tt.cacheResponseErr && cacheErr != nil {
 				return
 			}
 
-			obj, err := sWrapper.Get(tt.key)
+			keyInfo := storage.KeyBuildInfo{
+				Component: comp,
+				Namespace: info.Namespace,
+				Name:      info.Name,
+				Resources: info.Resource,
+				Group:     info.APIGroup,
+				Version:   info.APIVersion,
+			}
+			key, err := sWrapper.KeyFunc(keyInfo)
+			if err != nil {
+				t.Errorf("failed to create key, %v", err)
+			}
+			obj, err := sWrapper.Get(key)
 			if err != nil || obj == nil {
-				if tt.cacheErr != err {
-					t.Errorf("expect get error %v, but got %v", tt.cacheErr, err)
+				if !errors.Is(tt.expectResult.err, err) {
+					t.Errorf("expect get error %v, but got %v", tt.expectResult.err, err)
 				}
-				t.Logf("get expected err %v for key %s", tt.cacheErr, tt.key)
+				t.Logf("get expected err %v for key %s", tt.expectResult.err, keyInfo)
 			} else {
 				name, _ := accessor.Name(obj)
 				rv, _ := accessor.ResourceVersion(obj)
@@ -460,40 +552,38 @@ func TestCacheGetResponse(t *testing.T) {
 					t.Errorf("Got rv %s, but expect rv %s", rv, tt.expectResult.rv)
 				}
 
-				if tt.namespaced {
-					ns, _ := accessor.Namespace(obj)
-					if tt.expectResult.ns != ns {
-						t.Errorf("Got ns %s, but expect ns %s", ns, tt.expectResult.ns)
-					}
+				ns, _ := accessor.Namespace(obj)
+				if tt.expectResult.ns != ns {
+					t.Errorf("Got ns %s, but expect ns %s", ns, tt.expectResult.ns)
 				}
 
 				if tt.expectResult.kind != kind {
 					t.Errorf("Got kind %s, but expect kind %s", kind, tt.expectResult.kind)
 				}
-				t.Logf("get key %s successfully", tt.key)
+				t.Logf("get key %s successfully", keyInfo)
 			}
 
-			err = sWrapper.DeleteCollection("kubelet")
+			err = sWrapper.DeleteComponentResources("kubelet")
 			if err != nil {
 				t.Errorf("failed to delete collection: kubelet, %v", err)
 			}
+			if err = restRESTMapperMgr.ResetRESTMapper(); err != nil {
+				t.Errorf("failed to delete cached DynamicRESTMapper, %v", err)
+			}
 		})
 	}
-}
 
-func getEncoder() runtime.Encoder {
-	jsonSerializer := runtimejson.NewSerializer(runtimejson.DefaultMetaFactory, scheme.Scheme, scheme.Scheme, false)
-	directCodecFactory := runtimeserializer.WithoutConversionCodecFactory{
-		CodecFactory: scheme.Codecs,
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
 	}
-	return directCodecFactory.EncoderForVersion(jsonSerializer, v1.SchemeGroupVersion)
 }
 
 func TestCacheWatchResponse(t *testing.T) {
 	mkPod := func(id string, rv string) *v1.Pod {
 		return &v1.Pod{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "", Kind: "Pod"},
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
 			ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: "default", ResourceVersion: rv},
+			Spec:       v1.PodSpec{NodeName: "node1"},
 		}
 	}
 
@@ -516,43 +606,39 @@ func TestCacheWatchResponse(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to create disk storage, %v", err)
 	}
+	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(rootDir)
+	if err != nil {
+		t.Errorf("failed to create RESTMapper manager, %v", err)
+	}
 	sWrapper := NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	yurtCM := &cacheManager{
-		storage:           sWrapper,
-		serializerManager: serializerM,
-		cacheAgents:       make(map[string]bool),
-	}
+
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	yurtCM := NewCacheManager(sWrapper, serializerM, restRESTMapperMgr, configManager)
 
 	testcases := map[string]struct {
-		group        string
-		version      string
-		key          string
 		inputObj     []watch.Event
-		userAgent    string
-		accept       string
+		header       map[string]string
 		verb         string
 		path         string
-		namespaced   bool
 		expectResult struct {
 			err  bool
 			data map[string]struct{}
 		}
 	}{
 		"add pods": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/pods/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkPod("mypod1", "2")},
 				{Type: watch.Added, Object: mkPod("mypod2", "4")},
 				{Type: watch.Added, Object: mkPod("mypod3", "6")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -565,19 +651,17 @@ func TestCacheWatchResponse(t *testing.T) {
 			},
 		},
 		"add and delete pods": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/pods/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkPod("mypod1", "2")},
 				{Type: watch.Deleted, Object: mkPod("mypod1", "4")},
 				{Type: watch.Added, Object: mkPod("mypod3", "6")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -588,19 +672,17 @@ func TestCacheWatchResponse(t *testing.T) {
 			},
 		},
 		"add and update pods": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/pods/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkPod("mypod1", "2")},
 				{Type: watch.Modified, Object: mkPod("mypod1", "4")},
 				{Type: watch.Added, Object: mkPod("mypod3", "6")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -612,19 +694,17 @@ func TestCacheWatchResponse(t *testing.T) {
 			},
 		},
 		"not update pods": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/pods/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkPod("mypod1", "6")},
 				{Type: watch.Modified, Object: mkPod("mypod1", "4")},
 				{Type: watch.Modified, Object: mkPod("mypod1", "2")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -636,19 +716,17 @@ func TestCacheWatchResponse(t *testing.T) {
 		},
 		//used to test whether custom resource's watch-events can be cached correctly
 		"cache response for watch add crontabs": {
-			group:   "stable.example.com",
-			version: "v1",
-			key:     "kubelet/crontabs/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkCronTab("crontab1", "2")},
 				{Type: watch.Added, Object: mkCronTab("crontab2", "4")},
 				{Type: watch.Added, Object: mkCronTab("crontab3", "6")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -661,19 +739,17 @@ func TestCacheWatchResponse(t *testing.T) {
 			},
 		},
 		"cache response for watch add and delete crontabs": {
-			group:   "stable.example.com",
-			version: "v1",
-			key:     "kubelet/crontabs/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkCronTab("crontab1", "2")},
 				{Type: watch.Deleted, Object: mkCronTab("crontab1", "4")},
 				{Type: watch.Added, Object: mkCronTab("crontab3", "6")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -684,19 +760,17 @@ func TestCacheWatchResponse(t *testing.T) {
 			},
 		},
 		"cache response for watch add and update crontabs": {
-			group:   "stable.example.com",
-			version: "v1",
-			key:     "kubelet/crontabs/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkCronTab("crontab1", "2")},
 				{Type: watch.Modified, Object: mkCronTab("crontab1", "4")},
 				{Type: watch.Added, Object: mkCronTab("crontab3", "6")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -708,19 +782,17 @@ func TestCacheWatchResponse(t *testing.T) {
 			},
 		},
 		"cache response for watch not update crontabs": {
-			group:   "stable.example.com",
-			version: "v1",
-			key:     "kubelet/crontabs/default",
 			inputObj: []watch.Event{
 				{Type: watch.Added, Object: mkCronTab("crontab1", "6")},
 				{Type: watch.Modified, Object: mkCronTab("crontab1", "4")},
 				{Type: watch.Modified, Object: mkCronTab("crontab1", "2")},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs?watch=true",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -730,90 +802,212 @@ func TestCacheWatchResponse(t *testing.T) {
 				},
 			},
 		},
+		"should not return error when storing bookmark watch event": {
+			inputObj: []watch.Event{
+				{Type: watch.Bookmark, Object: mkPod("mypod1", "2")},
+			},
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods?watch=true",
+			expectResult: struct {
+				err  bool
+				data map[string]struct{}
+			}{
+				data: map[string]struct{}{},
+			},
+		},
+		"add pods for partial object metadata watch request": {
+			inputObj: []watch.Event{
+				{Type: watch.Added, Object: runtime.Object(&metav1.PartialObjectMetadata{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "meta.k8s.io/v1",
+						Kind:       "PartialObjectMetadata",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "mypod1",
+						Namespace:       "default",
+						ResourceVersion: "2",
+						UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab900",
+					},
+				})},
+				{Type: watch.Added, Object: runtime.Object(&metav1.PartialObjectMetadata{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "meta.k8s.io/v1",
+						Kind:       "PartialObjectMetadata",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "mypod2",
+						Namespace:       "default",
+						ResourceVersion: "3",
+						UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab901",
+					},
+				})},
+			},
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods?watch=true",
+			expectResult: struct {
+				err  bool
+				data map[string]struct{}
+			}{
+				data: map[string]struct{}{
+					"partialobjectmetadata-default-mypod1-2": {},
+					"partialobjectmetadata-default-mypod2-3": {},
+				},
+			},
+		},
+		"add crontabs for partial object metadata watch request": {
+			inputObj: []watch.Event{
+				{Type: watch.Added, Object: runtime.Object(&metav1.PartialObjectMetadata{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "meta.k8s.io/v1",
+						Kind:       "PartialObjectMetadata",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "crontab1",
+						ResourceVersion: "2",
+						UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab900",
+					},
+				})},
+				{Type: watch.Added, Object: runtime.Object(&metav1.PartialObjectMetadata{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "meta.k8s.io/v1",
+						Kind:       "PartialObjectMetadata",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "crontab2",
+						ResourceVersion: "3",
+						UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab901",
+					},
+				})},
+			},
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/crontabs?watch=true",
+			expectResult: struct {
+				err  bool
+				data map[string]struct{}
+			}{
+				data: map[string]struct{}{
+					"partialobjectmetadata-crontab1-2": {},
+					"partialobjectmetadata-crontab2-3": {},
+				},
+			},
+		},
 	}
 
-	accessor := meta.NewAccessor()
 	resolver := newTestRequestInfoResolver()
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
-			r, w := io.Pipe()
-			go func(w *io.PipeWriter) {
-				//For unregistered GVKs, the normal encoding is used by default and the original GVK information is set
-				encoder := restclientwatch.NewEncoder(streaming.NewEncoder(w, getEncoder()), getEncoder())
-
-				for i := range tt.inputObj {
-					if err := encoder.Encode(&tt.inputObj[i]); err != nil {
-						t.Errorf("%d: unexpected error: %v", i, err)
-						continue
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-				w.Close()
-			}(w)
-
 			req, _ := http.NewRequest(tt.verb, tt.path, nil)
-			if len(tt.userAgent) != 0 {
-				req.Header.Set("User-Agent", tt.userAgent)
-			}
-
-			if len(tt.accept) != 0 {
-				req.Header.Set("Accept", tt.accept)
+			for k, v := range tt.header {
+				req.Header.Set(k, v)
 			}
 			req.RemoteAddr = "127.0.0.1"
 
 			var err error
-			rc := ioutil.NopCloser(r)
+			var info *request.RequestInfo
+			var comp string
 			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				ctx := req.Context()
-				ctx = util.WithRespContentType(ctx, tt.accept)
-				err = yurtCM.CacheResponse(ctx, rc, nil)
+				info, _ = request.RequestInfoFrom(ctx)
+				// get component
+				comp, _ = util.TruncatedClientComponentFrom(ctx)
+
+				// inject response content type by request content type
+				reqContentType, _ := util.ReqContentTypeFrom(ctx)
+				ctx = util.WithRespContentType(ctx, reqContentType)
+				req = req.WithContext(ctx)
+
+				// build response body
+				gvr := schema.GroupVersionResource{
+					Group:    info.APIGroup,
+					Version:  info.APIVersion,
+					Resource: info.Resource,
+				}
+
+				convertGVK, ok := util.ConvertGVKFrom(ctx)
+				if ok && convertGVK != nil {
+					gvr, _ = meta.UnsafeGuessKindToResource(*convertGVK)
+					comp = util.AttachConvertGVK(comp, convertGVK)
+				}
+
+				s := serializerM.CreateSerializer(reqContentType, gvr.Group, gvr.Version, gvr.Resource)
+				pr, pw := io.Pipe()
+				go func(pw *io.PipeWriter) {
+					//For unregistered GVKs, the normal encoding is used by default and the original GVK information is set
+					for i := range tt.inputObj {
+						if _, err := s.WatchEncode(pw, &tt.inputObj[i]); err != nil {
+							t.Errorf("%d: encode watch unexpected error: %v", i, err)
+							continue
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+					pw.Close()
+				}(pw)
+				rc := io.NopCloser(pr)
+				err = yurtCM.CacheResponse(req, rc, nil)
 			})
 
 			handler = proxyutil.WithRequestContentType(handler)
 			handler = proxyutil.WithRequestClientComponent(handler)
+			handler = proxyutil.WithPartialObjectMetadataRequest(handler)
 			handler = filters.WithRequestInfo(handler, resolver)
 			handler.ServeHTTP(httptest.NewRecorder(), req)
 
 			if tt.expectResult.err && err == nil {
 				t.Errorf("expect err, but do not got err")
+			} else if err != nil && err != io.EOF {
+				t.Errorf("failed to cache response, %v", err)
 			}
 
 			if len(tt.expectResult.data) == 0 {
 				return
 			}
 
-			objs, err := sWrapper.List(tt.key)
+			keyInfo := storage.KeyBuildInfo{
+				Component: comp,
+				Namespace: info.Namespace,
+				Name:      info.Name,
+				Resources: info.Resource,
+				Group:     info.APIGroup,
+				Version:   info.APIVersion,
+			}
+			rootKey, err := sWrapper.KeyFunc(keyInfo)
+			if err != nil {
+				t.Errorf("failed to get key, %v", err)
+			}
+
+			objs, err := sWrapper.List(rootKey)
 			if err != nil || len(objs) == 0 {
 				t.Errorf("failed to get object from storage")
 			}
 
-			if len(objs) != len(tt.expectResult.data) {
-				t.Errorf("Got %d objects, but expect %d objects", len(objs), len(tt.expectResult.data))
+			if !compareObjectsAndKeys(t, objs, tt.expectResult.data) {
+				t.Errorf("got unexpected objects for keys for watch request")
 			}
 
-			for _, obj := range objs {
-				name, _ := accessor.Name(obj)
-				ns, _ := accessor.Namespace(obj)
-				rv, _ := accessor.ResourceVersion(obj)
-				kind, _ := accessor.Kind(obj)
-
-				var objKey string
-				if tt.namespaced {
-					objKey = fmt.Sprintf("%s-%s-%s-%s", strings.ToLower(kind), ns, name, rv)
-				} else {
-					objKey = fmt.Sprintf("%s-%s-%s", strings.ToLower(kind), name, rv)
-				}
-
-				if _, ok := tt.expectResult.data[objKey]; !ok {
-					t.Errorf("Got %s %s/%s with rv %s", kind, ns, name, rv)
-				}
-			}
-
-			err = sWrapper.DeleteCollection("kubelet")
+			err = sWrapper.DeleteComponentResources("kubelet")
 			if err != nil {
 				t.Errorf("failed to delete collection: kubelet, %v", err)
 			}
+			if err = restRESTMapperMgr.ResetRESTMapper(); err != nil {
+				t.Errorf("failed to delete cached DynamicRESTMapper, %v", err)
+			}
 		})
+	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
 	}
 }
 
@@ -825,33 +1019,26 @@ func TestCacheListResponse(t *testing.T) {
 	sWrapper := NewStorageWrapper(dStorage)
 
 	serializerM := serializer.NewSerializerManager()
-	yurtCM := &cacheManager{
-		storage:           sWrapper,
-		serializerManager: serializerM,
-		cacheAgents:       make(map[string]bool),
+	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(rootDir)
+	if err != nil {
+		t.Errorf("failed to create RESTMapper manager, %v", err)
 	}
 
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	yurtCM := NewCacheManager(sWrapper, serializerM, restRESTMapperMgr, configManager)
+
 	testcases := map[string]struct {
-		group        string
-		version      string
-		key          string
 		inputObj     runtime.Object
-		userAgent    string
-		accept       string
+		header       map[string]string
 		verb         string
 		path         string
-		resource     string
-		namespaced   bool
 		expectResult struct {
 			err  bool
 			data map[string]struct{}
 		}
-		cacheErr error
 	}{
 		"list pods": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/pods/default",
 			inputObj: runtime.Object(
 				&v1.PodList{
 					TypeMeta: metav1.TypeMeta{
@@ -898,12 +1085,12 @@ func TestCacheListResponse(t *testing.T) {
 					},
 				},
 			),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods",
-			resource:   "pods",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -916,9 +1103,6 @@ func TestCacheListResponse(t *testing.T) {
 			},
 		},
 		"list nodes": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/nodes",
 			inputObj: runtime.Object(
 				&v1.NodeList{
 					TypeMeta: metav1.TypeMeta{
@@ -972,12 +1156,12 @@ func TestCacheListResponse(t *testing.T) {
 					},
 				},
 			),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/nodes",
-			resource:   "nodes",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -990,10 +1174,7 @@ func TestCacheListResponse(t *testing.T) {
 				},
 			},
 		},
-		"list nodes with fieldselector": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/nodes",
+		"list nodes with fieldSelector": {
 			inputObj: runtime.Object(
 				&v1.NodeList{
 					TypeMeta: metav1.TypeMeta{
@@ -1017,12 +1198,12 @@ func TestCacheListResponse(t *testing.T) {
 					},
 				},
 			),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/nodes?fieldselector=meatadata.name=mynode",
-			resource:   "nodes",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes?fieldSelector=metadata.name=mynode",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -1033,9 +1214,6 @@ func TestCacheListResponse(t *testing.T) {
 			},
 		},
 		"list runtimeclasses with no objects": {
-			group:   "node.k8s.io",
-			version: "v1beta1",
-			key:     "kubelet/runtimeclasses",
 			inputObj: runtime.Object(
 				&nodev1beta1.RuntimeClassList{
 					TypeMeta: metav1.TypeMeta{
@@ -1048,12 +1226,12 @@ func TestCacheListResponse(t *testing.T) {
 					Items: []nodev1beta1.RuntimeClass{},
 				},
 			),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/node.k8s.io/v1beta1/runtimeclasses",
-			resource:   "runtimeclasses",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/node.k8s.io/v1beta1/runtimeclasses",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -1062,9 +1240,6 @@ func TestCacheListResponse(t *testing.T) {
 			},
 		},
 		"list with status": {
-			group:   "",
-			version: "v1",
-			key:     "kubelet/nodetest",
 			inputObj: runtime.Object(
 				&metav1.Status{
 					TypeMeta: metav1.TypeMeta{
@@ -1077,19 +1252,15 @@ func TestCacheListResponse(t *testing.T) {
 					Code:    404,
 				},
 			),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/node",
-			resource:   "nodes",
-			namespaced: false,
-			cacheErr:   storage.ErrStorageNotFound,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/node",
 		},
 		//used to test whether custom resource list can be cached correctly
 		"cache response for list crontabs": {
-			group:   "stable.example.com",
-			version: "v1",
-			key:     "kubelet/crontabs/default",
 			inputObj: runtime.Object(
 				&unstructured.UnstructuredList{
 					Object: map[string]interface{}{
@@ -1127,12 +1298,12 @@ func TestCacheListResponse(t *testing.T) {
 					},
 				},
 			),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs",
-			resource:   "crontabs",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -1144,9 +1315,6 @@ func TestCacheListResponse(t *testing.T) {
 			},
 		},
 		"cache response for list foos without namespace": {
-			group:   "samplecontroller.k8s.io",
-			version: "v1",
-			key:     "kubelet/foos",
 			inputObj: runtime.Object(
 				&unstructured.UnstructuredList{
 					Object: map[string]interface{}{
@@ -1182,12 +1350,12 @@ func TestCacheListResponse(t *testing.T) {
 					},
 				},
 			),
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/samplecontroller.k8s.io/v1/foos",
-			resource:   "foos",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/samplecontroller.k8s.io/v1/foos",
 			expectResult: struct {
 				err  bool
 				data map[string]struct{}
@@ -1198,88 +1366,246 @@ func TestCacheListResponse(t *testing.T) {
 				},
 			},
 		},
+		"list foos with no objects": {
+			inputObj: runtime.Object(
+				&unstructured.UnstructuredList{
+					Object: map[string]interface{}{
+						"apiVersion": "samplecontroller.k8s.io/v1",
+						"kind":       "FooList",
+						"metadata": map[string]interface{}{
+							"continue":        "",
+							"resourceVersion": "2",
+							"selfLink":        "/apis/samplecontroller.k8s.io/v1/foos",
+						},
+					},
+					Items: []unstructured.Unstructured{},
+				},
+			),
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/samplecontroller.k8s.io/v1/foos",
+			expectResult: struct {
+				err  bool
+				data map[string]struct{}
+			}{
+				data: map[string]struct{}{},
+			},
+		},
+		"list namespaces": {
+			inputObj: runtime.Object(
+				&v1.NamespaceList{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "v1",
+						Kind:       "NamespaceList",
+					},
+					ListMeta: metav1.ListMeta{
+						ResourceVersion: "3",
+					},
+					Items: []v1.Namespace{
+						{
+							TypeMeta: metav1.TypeMeta{
+								APIVersion: "v1",
+								Kind:       "Namespace",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name:            "kube-system",
+								ResourceVersion: "4",
+							},
+						},
+						{
+							TypeMeta: metav1.TypeMeta{
+								APIVersion: "v1",
+								Kind:       "Namespace",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name:            "default",
+								ResourceVersion: "5",
+							},
+						},
+					},
+				},
+			),
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces",
+			expectResult: struct {
+				err  bool
+				data map[string]struct{}
+			}{
+				data: map[string]struct{}{
+					"namespace-kube-system-4": {},
+					"namespace-default-5":     {},
+				},
+			},
+		},
+		"cache response for partial object metadata list request": {
+			inputObj: runtime.Object(&metav1.PartialObjectMetadataList{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "meta.k8s.io/v1",
+					Kind:       "PartialObjectMetadataList",
+				},
+				ListMeta: metav1.ListMeta{
+					ResourceVersion: "738",
+				},
+				Items: []metav1.PartialObjectMetadata{
+					{
+						TypeMeta: metav1.TypeMeta{
+							APIVersion: "meta.k8s.io/v1",
+							Kind:       "PartialObjectMetadata",
+						},
+						ObjectMeta: metav1.ObjectMeta{
+							Name:            "nodepools.apps.openyurt.io",
+							UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab900",
+							ResourceVersion: "738",
+						},
+					},
+					{
+						TypeMeta: metav1.TypeMeta{
+							APIVersion: "meta.k8s.io/v1",
+							Kind:       "PartialObjectMetadata",
+						},
+						ObjectMeta: metav1.ObjectMeta{
+							Name:            "yurtappsets.apps.openyurt.io",
+							UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab901",
+							ResourceVersion: "737",
+						},
+					},
+				},
+			}),
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+			},
+			verb: "GET",
+			path: "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+			expectResult: struct {
+				err  bool
+				data map[string]struct{}
+			}{
+				data: map[string]struct{}{
+					"partialobjectmetadata-nodepools.apps.openyurt.io-738":   {},
+					"partialobjectmetadata-yurtappsets.apps.openyurt.io-737": {},
+				},
+			},
+		},
 	}
 
-	accessor := meta.NewAccessor()
 	resolver := newTestRequestInfoResolver()
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
-			encoder, err := serializerM.CreateSerializers(tt.accept, tt.group, tt.version, tt.resource)
-			if err != nil {
-				t.Fatalf("could not create serializer, %v", err)
-			}
-
-			buf := bytes.NewBuffer([]byte{})
-			err = encoder.Encoder.Encode(tt.inputObj, buf)
-			if err != nil {
-				t.Fatalf("could not encode input object, %v", err)
-			}
-
 			req, _ := http.NewRequest(tt.verb, tt.path, nil)
-			if len(tt.userAgent) != 0 {
-				req.Header.Set("User-Agent", tt.userAgent)
-			}
-
-			if len(tt.accept) != 0 {
-				req.Header.Set("Accept", tt.accept)
+			for k, v := range tt.header {
+				req.Header.Set(k, v)
 			}
 			req.RemoteAddr = "127.0.0.1"
 
+			var cacheErr error
+			var info *request.RequestInfo
+			var comp string
 			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				ctx := req.Context()
-				ctx = util.WithRespContentType(ctx, tt.accept)
-				prc := ioutil.NopCloser(buf)
-				err = yurtCM.CacheResponse(ctx, prc, nil)
+				info, _ = request.RequestInfoFrom(ctx)
+				// get component
+				comp, _ = util.TruncatedClientComponentFrom(ctx)
+
+				// inject response content type by request content type
+				reqContentType, _ := util.ReqContentTypeFrom(ctx)
+				ctx = util.WithRespContentType(ctx, reqContentType)
+				req = req.WithContext(ctx)
+
+				// build response body
+				gvr := schema.GroupVersionResource{
+					Group:    info.APIGroup,
+					Version:  info.APIVersion,
+					Resource: info.Resource,
+				}
+
+				convertGVK, ok := util.ConvertGVKFrom(ctx)
+				if ok && convertGVK != nil {
+					gvr, _ = meta.UnsafeGuessKindToResource(*convertGVK)
+					comp = util.AttachConvertGVK(comp, convertGVK)
+				}
+
+				s := serializerM.CreateSerializer(reqContentType, gvr.Group, gvr.Version, gvr.Resource)
+				encoder, err := s.Encoder(reqContentType, nil)
+				if err != nil {
+					t.Fatalf("could not create encoder, %v", err)
+				}
+				buf := bytes.NewBuffer([]byte{})
+				if tt.inputObj != nil {
+					err = encoder.Encode(tt.inputObj, buf)
+					if err != nil {
+						t.Fatalf("could not encode input object, %v", err)
+					}
+				}
+				prc := io.NopCloser(buf)
+				// call cache response
+				cacheErr = yurtCM.CacheResponse(req, prc, nil)
 			})
 
 			handler = proxyutil.WithRequestContentType(handler)
 			handler = proxyutil.WithRequestClientComponent(handler)
+			handler = proxyutil.WithPartialObjectMetadataRequest(handler)
 			handler = filters.WithRequestInfo(handler, resolver)
 			handler.ServeHTTP(httptest.NewRecorder(), req)
 
 			if tt.expectResult.err {
-				if err == nil {
+				if cacheErr == nil {
 					t.Error("Got no error, but expect err")
+					return
 				}
 			} else {
 				if err != nil {
-					t.Errorf("Got error %v", err)
+					t.Errorf("Expect no error, but got error %v", err)
+					return
 				}
 
-				objs, err := sWrapper.List(tt.key)
+				keyInfo := storage.KeyBuildInfo{
+					Component: comp,
+					Namespace: info.Namespace,
+					Name:      info.Name,
+					Resources: info.Resource,
+					Group:     info.APIGroup,
+					Version:   info.APIVersion,
+				}
+				rootKey, err := sWrapper.KeyFunc(keyInfo)
 				if err != nil {
-					if err != tt.cacheErr {
-						t.Errorf("expect error %v, but got %v", tt.cacheErr, err)
-					}
+					t.Errorf("failed to get key, %v", err)
 				}
-
-				if len(objs) != len(tt.expectResult.data) {
-					t.Errorf("Got %d objects, but expect %d objects", len(objs), len(tt.expectResult.data))
-				}
-
-				for _, obj := range objs {
-					name, _ := accessor.Name(obj)
-					ns, _ := accessor.Namespace(obj)
-					rv, _ := accessor.ResourceVersion(obj)
-					kind, _ := accessor.Kind(obj)
-
-					var objKey string
-					if tt.namespaced {
-						objKey = fmt.Sprintf("%s-%s-%s-%s", strings.ToLower(kind), ns, name, rv)
+				objs, err := sWrapper.List(rootKey)
+				if err != nil {
+					// If error is storage.ErrStorageNotFound, it means that no object is cached in the hard disk
+					if errors.Is(err, storage.ErrStorageNotFound) {
+						if tt.expectResult.data != nil {
+							t.Errorf("expect %v objects, but get nil.", len(tt.expectResult.data))
+						}
 					} else {
-						objKey = fmt.Sprintf("%s-%s-%s", strings.ToLower(kind), name, rv)
+						t.Errorf("got unexpected error %v", err)
 					}
+				}
 
-					if _, ok := tt.expectResult.data[objKey]; !ok {
-						t.Errorf("Got %s %s/%s with rv %s", kind, ns, name, rv)
-					}
+				if !compareObjectsAndKeys(t, objs, tt.expectResult.data) {
+					t.Errorf("got unexpected objects for keys")
 				}
 			}
-			err = sWrapper.DeleteCollection("kubelet")
+			err = sWrapper.DeleteComponentResources("kubelet")
 			if err != nil {
 				t.Errorf("failed to delete collection: kubelet, %v", err)
 			}
+			if err = restRESTMapperMgr.ResetRESTMapper(); err != nil {
+				t.Errorf("failed to delete cached DynamicRESTMapper, %v", err)
+			}
 		})
+	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
 	}
 }
 
@@ -1290,14 +1616,17 @@ func TestQueryCacheForGet(t *testing.T) {
 	}
 	sWrapper := NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	yurtCM := &cacheManager{
-		storage:           sWrapper,
-		serializerManager: serializerM,
-		cacheAgents:       make(map[string]bool),
+	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(rootDir)
+	if err != nil {
+		t.Errorf("failed to create RESTMapper manager, %v", err)
 	}
 
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	yurtCM := NewCacheManager(sWrapper, serializerM, restRESTMapperMgr, configManager)
+
 	testcases := map[string]struct {
-		key          string
+		keyBuildInfo storage.KeyBuildInfo
 		inputObj     runtime.Object
 		userAgent    string
 		accept       string
@@ -1317,6 +1646,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			verb:       "GET",
 			path:       "/api/v1/namespaces/default/pods/mypod1",
 			namespaced: true,
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "pods",
+				Namespace: "default",
+				Name:      "mypod1",
+				Group:     "",
+				Version:   "v1",
+			},
 			expectResult: struct {
 				err  bool
 				rv   string
@@ -1332,6 +1669,10 @@ func TestQueryCacheForGet(t *testing.T) {
 			verb:       "GET",
 			path:       "/healthz",
 			namespaced: true,
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "healthz",
+			},
 			expectResult: struct {
 				err  bool
 				rv   string
@@ -1343,7 +1684,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"post pod": {
-			key: "kubelet/pods/default/mypod1",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "pods",
+				Namespace: "default",
+				Name:      "mypod1",
+				Group:     "",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&v1.Pod{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -1371,7 +1719,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"get pod": {
-			key: "kubelet/pods/default/mypod1",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "pods",
+				Namespace: "default",
+				Name:      "mypod1",
+				Group:     "",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&v1.Pod{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -1402,7 +1757,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"update pod": {
-			key: "kubelet/pods/default/mypod2",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "pods",
+				Namespace: "default",
+				Name:      "mypod2",
+				Group:     "",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&v1.Pod{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -1433,7 +1795,13 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"update node": {
-			key: "kubelet/nodes/mynode1",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "nodes",
+				Name:      "mynode1",
+				Group:     "",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&v1.Node{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -1462,7 +1830,13 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"patch node": {
-			key: "kubelet/nodes/mynode2",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "nodes",
+				Name:      "mynode2",
+				Group:     "",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&v1.Node{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "v1",
@@ -1497,6 +1871,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			verb:       "GET",
 			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs/crontab1",
 			namespaced: true,
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "crontabs",
+				Namespace: "default",
+				Name:      "crontab1",
+				Group:     "stable.example.com",
+				Version:   "v1",
+			},
 			expectResult: struct {
 				err  bool
 				rv   string
@@ -1508,7 +1890,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query post crontab": {
-			key: "kubelet/crontabs/default/crontab1",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "crontabs",
+				Namespace: "default",
+				Name:      "crontab1",
+				Group:     "stable.example.com",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "stable.example.com/v1",
@@ -1536,7 +1925,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query get crontab": {
-			key: "kubelet/crontabs/default/crontab1",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "crontabs",
+				Namespace: "default",
+				Name:      "crontab1",
+				Group:     "stable.example.com",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "stable.example.com/v1",
@@ -1567,7 +1963,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query update crontab": {
-			key: "kubelet/crontabs/default/crontab2",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "crontabs",
+				Namespace: "default",
+				Name:      "crontab2",
+				Group:     "stable.example.com",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "stable.example.com/v1",
@@ -1598,7 +2001,14 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query patch crontab": {
-			key: "kubelet/crontabs/default/crontab3",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "crontabs",
+				Namespace: "default",
+				Name:      "crontab3",
+				Group:     "stable.example.com",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "stable.example.com/v1",
@@ -1629,7 +2039,13 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query post foo": {
-			key: "kubelet/foos/foo1",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "foos",
+				Name:      "foo1",
+				Group:     "samplecontroller.k8s.io",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "samplecontroller.k8s.io/v1",
@@ -1656,7 +2072,13 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query get foo": {
-			key: "kubelet/foos/foo1",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "foos",
+				Name:      "foo1",
+				Group:     "samplecontroller.k8s.io",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "samplecontroller.k8s.io/v1",
@@ -1685,7 +2107,13 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query update foo": {
-			key: "kubelet/foos/foo2",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "foos",
+				Name:      "foo2",
+				Group:     "samplecontroller.k8s.io",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "samplecontroller.k8s.io/v1",
@@ -1714,7 +2142,13 @@ func TestQueryCacheForGet(t *testing.T) {
 			},
 		},
 		"query patch foo": {
-			key: "kubelet/foos/foo3",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "foos",
+				Name:      "foo3",
+				Group:     "samplecontroller.k8s.io",
+				Version:   "v1",
+			},
 			inputObj: runtime.Object(&unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "samplecontroller.k8s.io/v1",
@@ -1748,7 +2182,12 @@ func TestQueryCacheForGet(t *testing.T) {
 	resolver := newTestRequestInfoResolver()
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
-			_ = sWrapper.Create(tt.key, tt.inputObj)
+			var err error
+			key, err := sWrapper.KeyFunc(tt.keyBuildInfo)
+			if err != nil {
+				t.Errorf("failed to get key with info %v, %v", tt.keyBuildInfo, err)
+			}
+			_ = sWrapper.Create(key, tt.inputObj)
 			req, _ := http.NewRequest(tt.verb, tt.path, nil)
 			if len(tt.userAgent) != 0 {
 				req.Header.Set("User-Agent", tt.userAgent)
@@ -1761,7 +2200,6 @@ func TestQueryCacheForGet(t *testing.T) {
 			req.RemoteAddr = "127.0.0.1"
 
 			var name, ns, rv, kind string
-			var err error
 			var obj runtime.Object
 			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				obj, err = yurtCM.QueryCache(req)
@@ -1805,13 +2243,101 @@ func TestQueryCacheForGet(t *testing.T) {
 				}
 			}
 
-			err = sWrapper.DeleteCollection("kubelet")
+			err = sWrapper.DeleteComponentResources("kubelet")
 			if err != nil {
 				t.Errorf("failed to delete collection: kubelet, %v", err)
 			}
 		})
 	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
 }
+
+// func TestQueryCacheForGetClusterInfo(t *testing.T) {
+// 	dStorage, err := disk.NewDiskStorage(rootDir)
+// 	if err != nil {
+// 		t.Errorf("failed to create disk storage, %v", err)
+// 	}
+// 	sWrapper := NewStorageWrapper(dStorage)
+// 	serializerM := serializer.NewSerializerManager()
+// 	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(rootDir)
+// 	if err != nil {
+// 		t.Errorf("failed to create RESTMapper manager, %v", err)
+// 	}
+// 	yurtCM := NewCacheManager(fakeClient, sWrapper, serializerM, restRESTMapperMgr, fakeSharedInformerFactory)
+
+// 	testcases := map[string]struct {
+// 		path         string
+// 		inputInfo    []byte
+// 		expectResult struct {
+// 			expectInfo []byte
+// 			expectErr  error
+// 		}
+// 	}{
+// 		"query version info": {
+// 			path:      "/version",
+// 			inputInfo: []byte(versionBytes),
+// 			expectResult: struct {
+// 				expectInfo []byte
+// 				expectErr  error
+// 			}{
+// 				expectInfo: []byte(versionBytes),
+// 				expectErr:  nil,
+// 			},
+// 		},
+// 		"query version info with parameters": {
+// 			path:      "/version?timeout=32s",
+// 			inputInfo: []byte(versionBytes),
+// 			expectResult: struct {
+// 				expectInfo []byte
+// 				expectErr  error
+// 			}{
+// 				expectInfo: []byte(versionBytes),
+// 				expectErr:  nil,
+// 			},
+// 		},
+// 		"query version info not existing": {
+// 			path:      "/version",
+// 			inputInfo: nil,
+// 			expectResult: struct {
+// 				expectInfo []byte
+// 				expectErr  error
+// 			}{
+// 				expectInfo: nil,
+// 				expectErr:  storage.ErrStorageNotFound,
+// 			},
+// 		},
+// 		"query unknown ClusterInfoType": {
+// 			path:      "/any-path",
+// 			inputInfo: nil,
+// 			expectResult: struct {
+// 				expectInfo []byte
+// 				expectErr  error
+// 			}{
+// 				expectInfo: nil,
+// 				expectErr:  storage.ErrUnknownClusterInfoType,
+// 			},
+// 		},
+// 	}
+
+// 	resolver := newTestRequestInfoResolver()
+// 	for k, tt := range testcases {
+// 		t.Run(k, func(t *testing.T) {
+// 			var err error
+// 			req, _ := http.NewRequest("GET", tt.path, nil)
+// 			var buf []byte
+// 			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// 				buf, err = yurtCM.QueryClusterInfoFromCache(req)
+// 			})
+// 			handler = filters.WithRequestInfo(handler, resolver)
+// 			if tt.inputInfo != nil {
+// 				sWrapper.SaveClusterInfo()
+// 			}
+// 		})
+// 	}
+// }
 
 func TestQueryCacheForList(t *testing.T) {
 	dStorage, err := disk.NewDiskStorage(rootDir)
@@ -1820,43 +2346,44 @@ func TestQueryCacheForList(t *testing.T) {
 	}
 	sWrapper := NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	yurtCM := &cacheManager{
-		storage:           sWrapper,
-		serializerManager: serializerM,
-		cacheAgents:       make(map[string]bool),
+	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(rootDir)
+	if err != nil {
+		t.Errorf("failed to create RESTMapper manager, %v", err)
 	}
 
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	yurtCM := NewCacheManager(sWrapper, serializerM, restRESTMapperMgr, configManager)
+
 	testcases := map[string]struct {
-		keyPrefix    string
-		noObjs       bool
+		keyBuildInfo *storage.KeyBuildInfo
 		inputObj     []runtime.Object
-		userAgent    string
-		accept       string
+		header       map[string]string
 		verb         string
 		path         string
-		namespaced   bool
 		expectResult struct {
-			err  bool
-			rv   string
-			data map[string]struct{}
+			err      bool
+			queryErr error
+			rv       string
+			data     map[string]struct{}
 		}
-		queryErr error
 	}{
 		"list with no user agent": {
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods",
-			namespaced: true,
+			header: map[string]string{
+				"Accept": "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods",
 			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
 			}{
 				err: true,
 			},
 		},
 		"list pods": {
-			keyPrefix: "kubelet/pods/default",
 			inputObj: []runtime.Object{
 				&v1.Pod{
 					TypeMeta: metav1.TypeMeta{
@@ -1892,15 +2419,17 @@ func TestQueryCacheForList(t *testing.T) {
 					},
 				},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/namespaces/default/pods",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods",
 			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
 			}{
 				rv: "5",
 				data: map[string]struct{}{
@@ -1911,7 +2440,6 @@ func TestQueryCacheForList(t *testing.T) {
 			},
 		},
 		"list nodes": {
-			keyPrefix: "kubelet/nodes",
 			inputObj: []runtime.Object{
 				&v1.Node{
 					TypeMeta: metav1.TypeMeta{
@@ -1954,15 +2482,17 @@ func TestQueryCacheForList(t *testing.T) {
 					},
 				},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/nodes",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes",
 			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
 			}{
 				rv: "12",
 				data: map[string]struct{}{
@@ -1973,10 +2503,25 @@ func TestQueryCacheForList(t *testing.T) {
 				},
 			},
 		},
-
+		"list pods of one namespace and no pods of this namespace in cache": {
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/pods/namespaces/default",
+			expectResult: struct {
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
+			}{
+				err:      true,
+				queryErr: storage.ErrStorageNotFound,
+			},
+		},
 		//used to test whether the query local Custom Resource list request can be handled correctly
 		"list crontabs": {
-			keyPrefix: "kubelet/crontabs/default",
 			inputObj: []runtime.Object{
 				&unstructured.Unstructured{
 					Object: map[string]interface{}{
@@ -2012,15 +2557,17 @@ func TestQueryCacheForList(t *testing.T) {
 					},
 				},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/stable.example.com/v1/namespaces/default/crontabs",
-			namespaced: true,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/stable.example.com/v1/namespaces/default/crontabs",
 			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
 			}{
 				rv: "5",
 				data: map[string]struct{}{
@@ -2031,7 +2578,6 @@ func TestQueryCacheForList(t *testing.T) {
 			},
 		},
 		"list foos": {
-			keyPrefix: "kubelet/foos",
 			inputObj: []runtime.Object{
 				&unstructured.Unstructured{
 					Object: map[string]interface{}{
@@ -2064,15 +2610,17 @@ func TestQueryCacheForList(t *testing.T) {
 					},
 				},
 			},
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/samplecontroller.k8s.io/v1/foos",
-			namespaced: false,
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/samplecontroller.k8s.io/v1/foos",
 			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
 			}{
 				rv: "5",
 				data: map[string]struct{}{
@@ -2082,53 +2630,139 @@ func TestQueryCacheForList(t *testing.T) {
 				},
 			},
 		},
-		"list runtimeclass": {
-			keyPrefix:  "kubelet/runtimeclasses",
-			noObjs:     true,
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/apis/node.k8s.io/v1beta1/runtimeclasses",
-			namespaced: false,
+		"list unregistered resources": {
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/apis/sample.k8s.io/v1/abcs",
 			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
 			}{
+				err:      true,
+				queryErr: hubmeta.ErrGVRNotRecognized,
+			},
+		},
+		"list resources not exist": {
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes",
+			expectResult: struct {
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
+			}{
+				err:      true,
+				queryErr: storage.ErrStorageNotFound,
+			},
+		},
+		"list non-existing resource with metadata.name fieldSelector": {
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/namespaces/kube-system/configmaps?fieldSelector=metadata.name%3Dkubernetes-services-endpoint",
+			expectResult: struct {
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
+			}{
+				err:  false,
 				data: map[string]struct{}{},
 			},
 		},
-		"list pods and no pods in cache": {
-			keyPrefix:  "kubelet/pods",
-			noObjs:     true,
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/pods",
-			namespaced: false,
-			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
-			}{
-				err: true,
+		"list existing resource with metadata.name fieldSelector": {
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
 			},
-			queryErr: storage.ErrStorageNotFound,
+			verb: "GET",
+			path: "/api/v1/namespaces/default/pods?fieldSelector=metadata.name%3Dnginx",
+			inputObj: []runtime.Object{
+				&v1.Pod{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "v1",
+						Kind:       "Pod",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "nginx",
+						Namespace:       "default",
+						ResourceVersion: "5",
+					},
+				},
+			},
+			expectResult: struct {
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
+			}{
+				err: false,
+				rv:  "5",
+				data: map[string]struct{}{
+					"pod-default-nginx-5": {},
+				},
+			},
 		},
-		"list resources not exist": {
-			userAgent:  "kubelet",
-			accept:     "application/json",
-			verb:       "GET",
-			path:       "/api/v1/nodes",
-			namespaced: false,
-			expectResult: struct {
-				err  bool
-				rv   string
-				data map[string]struct{}
-			}{
-				err: true,
+		"list crds by partial object metadata request": {
+			keyBuildInfo: &storage.KeyBuildInfo{
+				Component: "kubelet/partialobjectmetadatas.v1.meta.k8s.io",
+				Resources: "customresourcedefinitions",
+				Group:     "apiextensions.k8s.io",
+				Version:   "v1",
 			},
-			queryErr: storage.ErrStorageNotFound,
+			inputObj: []runtime.Object{
+				&metav1.PartialObjectMetadata{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "meta.k8s.io/v1",
+						Kind:       "PartialObjectMetadata",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "nodepools.apps.openyurt.io",
+						UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab900",
+						ResourceVersion: "738",
+					},
+				},
+				&metav1.PartialObjectMetadata{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "meta.k8s.io/v1",
+						Kind:       "PartialObjectMetadata",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "yurtappsets.apps.openyurt.io",
+						UID:             "4232ad7f-c347-43a3-b64a-1c4bdfeab901",
+						ResourceVersion: "737",
+					},
+				},
+			},
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+			},
+			verb: "GET",
+			path: "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+			expectResult: struct {
+				err      bool
+				queryErr error
+				rv       string
+				data     map[string]struct{}
+			}{
+				rv: "738",
+				data: map[string]struct{}{
+					"partialobjectmetadata-nodepools.apps.openyurt.io-738":   {},
+					"partialobjectmetadata-yurtappsets.apps.openyurt.io-737": {},
+				},
+			},
 		},
 	}
 
@@ -2137,24 +2771,43 @@ func TestQueryCacheForList(t *testing.T) {
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
 			for i := range tt.inputObj {
-				v, _ := accessor.Name(tt.inputObj[i])
-				key := filepath.Join(tt.keyPrefix, v)
-				_ = sWrapper.Create(key, tt.inputObj[i])
-			}
+				name, _ := accessor.Name(tt.inputObj[i])
+				ns, _ := accessor.Namespace(tt.inputObj[i])
+				gvk := tt.inputObj[i].GetObjectKind().GroupVersionKind()
+				gvr, _ := meta.UnsafeGuessKindToResource(gvk)
+				comp := tt.header["User-Agent"]
 
-			if tt.noObjs {
-				_ = sWrapper.Create(tt.keyPrefix, nil)
+				keyBuildInfo := storage.KeyBuildInfo{
+					Component: comp,
+					Resources: gvr.Resource,
+					Group:     gvr.Group,
+					Version:   gvr.Version,
+					Namespace: ns,
+					Name:      name,
+				}
+
+				if tt.keyBuildInfo != nil {
+					tt.keyBuildInfo.Name = name
+					tt.keyBuildInfo.Namespace = ns
+					keyBuildInfo = *tt.keyBuildInfo
+				}
+
+				key, err := sWrapper.KeyFunc(keyBuildInfo)
+				if err != nil {
+					t.Errorf("failed to get key, %v", err)
+				}
+				_ = sWrapper.Create(key, tt.inputObj[i])
+
+				isScheme, t := restRESTMapperMgr.KindFor(gvr)
+				if !isScheme && t.Empty() {
+					_ = restRESTMapperMgr.UpdateKind(gvk)
+				}
 			}
 
 			req, _ := http.NewRequest(tt.verb, tt.path, nil)
-			if len(tt.userAgent) != 0 {
-				req.Header.Set("User-Agent", tt.userAgent)
+			for k, v := range tt.header {
+				req.Header.Set(k, v)
 			}
-
-			if len(tt.accept) != 0 {
-				req.Header.Set("Accept", tt.accept)
-			}
-
 			req.RemoteAddr = "127.0.0.1"
 
 			items := make([]runtime.Object, 0)
@@ -2164,13 +2817,17 @@ func TestQueryCacheForList(t *testing.T) {
 			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				list, err = yurtCM.QueryCache(req)
 				if err == nil {
-					listMetaInterface, _ := meta.ListAccessor(list)
+					listMetaInterface, err := meta.ListAccessor(list)
+					if err != nil {
+						t.Errorf("failed to access list obj, %v", err)
+					}
 					rv = listMetaInterface.GetResourceVersion()
 					items, _ = meta.ExtractList(list)
 				}
 			})
 
 			handler = proxyutil.WithRequestClientComponent(handler)
+			handler = proxyutil.WithPartialObjectMetadataRequest(handler)
 			handler = filters.WithRequestInfo(handler, resolver)
 			handler.ServeHTTP(httptest.NewRecorder(), req)
 
@@ -2179,8 +2836,8 @@ func TestQueryCacheForList(t *testing.T) {
 					t.Errorf("Got no error, but expect err")
 				}
 
-				if tt.queryErr != nil && tt.queryErr != err {
-					t.Errorf("expect err %v, but got %v", tt.queryErr, err)
+				if tt.expectResult.queryErr != nil && !errors.Is(tt.expectResult.queryErr, err) {
+					t.Errorf("expect err %v, but got %v", tt.expectResult.queryErr, err)
 				}
 			} else {
 				if err != nil {
@@ -2191,34 +2848,228 @@ func TestQueryCacheForList(t *testing.T) {
 					t.Errorf("Got rv %s, but expect rv %s", rv, tt.expectResult.rv)
 				}
 
-				if len(items) != len(tt.expectResult.data) {
-					t.Errorf("Got %d objects, but expect %d objects", len(items), len(tt.expectResult.data))
-				}
-
-				for i := range items {
-					kind, _ := accessor.Kind(items[i])
-					ns, _ := accessor.Namespace(items[i])
-					name, _ := accessor.Name(items[i])
-					itemRv, _ := accessor.ResourceVersion(items[i])
-
-					var itemKey string
-					if tt.namespaced {
-						itemKey = fmt.Sprintf("%s-%s-%s-%s", strings.ToLower(kind), ns, name, itemRv)
-					} else {
-						itemKey = fmt.Sprintf("%s-%s-%s", strings.ToLower(kind), name, itemRv)
-					}
-
-					if expectKey, ok := tt.expectResult.data[itemKey]; !ok {
-						t.Errorf("Got item key %s, but expect key %s", itemKey, expectKey)
-					}
+				if !compareObjectsAndKeys(t, items, tt.expectResult.data) {
+					t.Errorf("got unexpected objects for keys")
 				}
 			}
-			err = sWrapper.DeleteCollection("kubelet")
+			err = sWrapper.DeleteComponentResources("kubelet")
+			if err != nil {
+				t.Errorf("failed to delete collection: kubelet, %v", err)
+			}
+
+			if err = restRESTMapperMgr.ResetRESTMapper(); err != nil {
+				t.Errorf("failed to delete cached DynamicRESTMapper, %v", err)
+			}
+		})
+	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
+}
+
+func TestInMemoryCacheDeepCopy(t *testing.T) {
+	dStorage, err := disk.NewDiskStorage(rootDir)
+	if err != nil {
+		t.Errorf("failed to create disk storage, %v", err)
+	}
+	sWrapper := NewStorageWrapper(dStorage)
+	serializerM := serializer.NewSerializerManager()
+	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(rootDir)
+	if err != nil {
+		t.Errorf("failed to create RESTMapper manager, %v", err)
+	}
+
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	yurtCM := NewCacheManager(sWrapper, serializerM, restRESTMapperMgr, configManager)
+
+	testcases := map[string]struct {
+		inputObj     runtime.Object
+		header       map[string]string
+		verb         string
+		path         string
+		expectResult struct {
+			rv   string
+			name string
+		}
+	}{
+		"deep copy node on in-memory cache": {
+			inputObj: runtime.Object(&v1.Node{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "v1",
+					Kind:       "Node",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "mynode1",
+					ResourceVersion: "1",
+				},
+			}),
+			header: map[string]string{
+				"User-Agent": "kubelet",
+				"Accept":     "application/json",
+			},
+			verb: "GET",
+			path: "/api/v1/nodes/mynode1",
+			expectResult: struct {
+				rv   string
+				name string
+			}{
+				rv:   "1",
+				name: "mynode1",
+			},
+		},
+	}
+
+	accessor := meta.NewAccessor()
+	resolver := newTestRequestInfoResolver()
+	for k, tt := range testcases {
+		t.Run(k, func(t *testing.T) {
+			originalNode := tt.inputObj.(*v1.Node)
+			originalName := originalNode.Name
+
+			req, _ := http.NewRequest(tt.verb, tt.path, nil)
+			for key, value := range tt.header {
+				req.Header.Set(key, value)
+			}
+			req.RemoteAddr = "127.0.0.1"
+
+			var cacheErr error
+			var info *request.RequestInfo
+			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				ctx := req.Context()
+				info, _ = request.RequestInfoFrom(ctx)
+				_, _ = util.TruncatedClientComponentFrom(ctx)
+
+				reqContentType, _ := util.ReqContentTypeFrom(ctx)
+				ctx = util.WithRespContentType(ctx, reqContentType)
+				req = req.WithContext(ctx)
+
+				gvr := schema.GroupVersionResource{
+					Group:    info.APIGroup,
+					Version:  info.APIVersion,
+					Resource: info.Resource,
+				}
+
+				s := serializerM.CreateSerializer(reqContentType, gvr.Group, gvr.Version, gvr.Resource)
+				encoder, err := s.Encoder(reqContentType, nil)
+				if err != nil {
+					t.Fatalf("could not create encoder, %v", err)
+				}
+				buf := bytes.NewBuffer([]byte{})
+				if tt.inputObj != nil {
+					err = encoder.Encode(tt.inputObj, buf)
+					if err != nil {
+						t.Fatalf("could not encode input object, %v", err)
+					}
+				}
+				prc := io.NopCloser(buf)
+				cacheErr = yurtCM.CacheResponse(req, prc, nil)
+			})
+
+			handler = proxyutil.WithRequestContentType(handler)
+			handler = proxyutil.WithRequestClientComponent(handler)
+			handler = filters.WithRequestInfo(handler, resolver)
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			if cacheErr != nil {
+				t.Errorf("Got error when cache response, %v", cacheErr)
+			}
+
+			req2, _ := http.NewRequest(tt.verb, tt.path, nil)
+			for key, value := range tt.header {
+				req2.Header.Set(key, value)
+			}
+			req2.RemoteAddr = "127.0.0.1"
+
+			var obj runtime.Object
+			var err error
+			var handler2 http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				obj, err = yurtCM.QueryCache(req)
+			})
+
+			handler2 = proxyutil.WithRequestClientComponent(handler2)
+			handler2 = filters.WithRequestInfo(handler2, resolver)
+			handler2.ServeHTTP(httptest.NewRecorder(), req2)
+
+			if err != nil {
+				t.Errorf("Got error %v", err)
+			}
+
+			if obj == nil {
+				t.Errorf("Got nil obj, but expect obj")
+				return
+			}
+
+			retrievedNode, ok := obj.(*v1.Node)
+			if !ok {
+				t.Errorf("Got obj type %T, but expect *v1.Node", obj)
+				return
+			}
+
+			name, _ := accessor.Name(retrievedNode)
+			rv, _ := accessor.ResourceVersion(retrievedNode)
+
+			if tt.expectResult.name != name {
+				t.Errorf("Got name %s, but expect name %s", name, tt.expectResult.name)
+			}
+
+			if tt.expectResult.rv != rv {
+				t.Errorf("Got rv %s, but expect rv %s", rv, tt.expectResult.rv)
+			}
+
+			originalNode.Name = "modified-node"
+			retrievedNameAfterModify, _ := accessor.Name(retrievedNode)
+			if retrievedNameAfterModify == "modified-node" {
+				t.Errorf("Got cached name %s after modify original, but expect %s", retrievedNameAfterModify, originalName)
+			}
+
+			err = sWrapper.DeleteComponentResources("kubelet")
 			if err != nil {
 				t.Errorf("failed to delete collection: kubelet, %v", err)
 			}
 		})
 	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
+}
+
+func compareObjectsAndKeys(t *testing.T, objs []runtime.Object, keys map[string]struct{}) bool {
+	if len(objs) != len(keys) {
+		t.Errorf("expect %d keys, but got %d objects", len(keys), len(objs))
+		return false
+	}
+
+	accessor := meta.NewAccessor()
+	objKeys := make(map[string]struct{})
+	for i := range objs {
+		kind, _ := accessor.Kind(objs[i])
+		ns, _ := accessor.Namespace(objs[i])
+		name, _ := accessor.Name(objs[i])
+		itemRv, _ := accessor.ResourceVersion(objs[i])
+
+		if len(ns) != 0 {
+			objKeys[fmt.Sprintf("%s-%s-%s-%s", strings.ToLower(kind), ns, name, itemRv)] = struct{}{}
+		} else {
+			objKeys[fmt.Sprintf("%s-%s-%s", strings.ToLower(kind), name, itemRv)] = struct{}{}
+		}
+	}
+
+	if len(objKeys) != len(keys) {
+		t.Errorf("expect %d keys, but got %d object keys", len(keys), len(objKeys))
+		return false
+	}
+
+	for key := range objKeys {
+		if _, ok := keys[key]; !ok {
+			t.Errorf("got unexpected object with key: %s", key)
+			return false
+		}
+	}
+
+	return true
 }
 
 func TestCanCacheFor(t *testing.T) {
@@ -2227,7 +3078,6 @@ func TestCanCacheFor(t *testing.T) {
 		t.Errorf("failed to create disk storage, %v", err)
 	}
 	s := NewStorageWrapper(dStorage)
-	m, _ := NewCacheManager(s, nil)
 
 	type proxyRequest struct {
 		userAgent string
@@ -2237,6 +3087,7 @@ func TestCanCacheFor(t *testing.T) {
 	}
 
 	testcases := map[string]struct {
+		cacheAgents    string
 		preRequest     *proxyRequest
 		preExpectCache bool
 		request        *proxyRequest
@@ -2289,38 +3140,19 @@ func TestCanCacheFor(t *testing.T) {
 			},
 			expectCache: true,
 		},
-		"default user agent edge-tunnel-agent": {
+		"default user agent tunnel-agent": {
 			request: &proxyRequest{
-				userAgent: "edge-tunnel-agent",
+				userAgent: projectinfo.GetAgentName(),
 				verb:      "HEAD",
 				path:      "/api/v1/nodes/mynode",
 			},
 			expectCache: true,
-		},
-		"with cache header": {
-			request: &proxyRequest{
-				userAgent: "test1",
-				verb:      "GET",
-				path:      "/api/v1/nodes/mynode",
-				header:    map[string]string{"Edge-Cache": "true"},
-			},
-			expectCache: true,
-		},
-		"with cache header false": {
-			request: &proxyRequest{
-				userAgent: "test2",
-				verb:      "GET",
-				path:      "/api/v1/nodes/mynode",
-				header:    map[string]string{"Edge-Cache": "false"},
-			},
-			expectCache: false,
 		},
 		"not resource request": {
 			request: &proxyRequest{
 				userAgent: "test2",
 				verb:      "GET",
 				path:      "/healthz",
-				header:    map[string]string{"Edge-Cache": "true"},
 			},
 			expectCache: false,
 		},
@@ -2420,7 +3252,7 @@ func TestCanCacheFor(t *testing.T) {
 			},
 			expectCache: false,
 		},
-		"list requests get same resouces but with different path": {
+		"list requests get same resources but with different path": {
 			preRequest: &proxyRequest{
 				userAgent: "kubelet",
 				verb:      "GET",
@@ -2434,28 +3266,92 @@ func TestCanCacheFor(t *testing.T) {
 			},
 			expectCache: false,
 		},
+		"cacheAgents *": {
+			request: &proxyRequest{
+				userAgent: "lc",
+				verb:      "GET",
+				path:      "/api/v1/namespaces/default/pods/test/status",
+			},
+			cacheAgents: "*",
+			expectCache: true,
+		},
+		"cacheAgents *  for old": {
+			request: &proxyRequest{
+				userAgent: "lc",
+				verb:      "GET",
+				path:      "/api/v1/namespaces/default/pods/test/status",
+			},
+			cacheAgents: "*,xxx",
+			expectCache: true,
+		},
+		"cacheAgents without *": {
+			request: &proxyRequest{
+				userAgent: "lc",
+				verb:      "GET",
+				path:      "/api/v1/namespaces/default/pods/test/status",
+			},
+			cacheAgents: "xxx",
+			expectCache: false,
+		},
+		"do not cache csr": {
+			request: &proxyRequest{
+				userAgent: "kubelet",
+				verb:      "POST",
+				path:      "/apis/certificates.k8s.io/v1/certificatesigningrequests",
+			},
+			expectCache: false,
+		},
+		"do not cache sar": {
+			request: &proxyRequest{
+				userAgent: "kubelet",
+				verb:      "POST",
+				path:      "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+			},
+			expectCache: false,
+		},
+		"default user agent kubelet with partialobjectmetadata info": {
+			request: &proxyRequest{
+				userAgent: "kubelet/v1.0",
+				verb:      "GET",
+				path:      "/api/v1/nodes/mynode",
+				header:    map[string]string{"Accept": "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"},
+			},
+			expectCache: true,
+		},
 	}
 
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
+			stop := make(chan struct{})
+			defer close(stop)
+			client := fake.NewSimpleClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			configManager := configuration.NewConfigurationManager("node1", informerFactory)
+			m := NewCacheManager(s, nil, nil, configManager)
+			informerFactory.Start(nil)
+			cache.WaitForCacheSync(stop, informerFactory.Core().V1().ConfigMaps().Informer().HasSynced)
 			if tt.preRequest != nil {
-				reqCanCache := checkReqCanCache(m, tt.preRequest.userAgent, tt.preRequest.verb, tt.preRequest.path, tt.preRequest.header)
+				reqCanCache := checkReqCanCache(m, tt.preRequest.userAgent, tt.preRequest.verb, tt.preRequest.path, tt.preRequest.header, tt.cacheAgents, client)
 				if reqCanCache != tt.preExpectCache {
 					t.Errorf("Got request pre can cache %v, but expect request pre can cache %v", reqCanCache, tt.preExpectCache)
 				}
 			}
 
 			if tt.request != nil {
-				reqCanCache := checkReqCanCache(m, tt.request.userAgent, tt.request.verb, tt.request.path, tt.request.header)
+				reqCanCache := checkReqCanCache(m, tt.request.userAgent, tt.request.verb, tt.request.path, tt.request.header, tt.cacheAgents, client)
 				if reqCanCache != tt.expectCache {
 					t.Errorf("Got request can cache %v, but expect request can cache %v", reqCanCache, tt.expectCache)
 				}
 			}
 		})
 	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
 }
 
-func checkReqCanCache(m CacheManager, userAgent, verb, path string, header map[string]string) bool {
+func checkReqCanCache(m CacheManager, userAgent, verb, path string, header map[string]string, cacheAgents string, testClient *fake.Clientset) bool {
 	req, _ := http.NewRequest(verb, path, nil)
 	if len(userAgent) != 0 {
 		req.Header.Set("User-Agent", userAgent)
@@ -2466,7 +3362,22 @@ func checkReqCanCache(m CacheManager, userAgent, verb, path string, header map[s
 	}
 
 	req.RemoteAddr = "127.0.0.1"
-
+	if cacheAgents != "" {
+		_, err := testClient.CoreV1().ConfigMaps(util.YurtHubNamespace).Create(context.Background(), &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      util.YurthubConfigMapName,
+				Namespace: util.YurtHubNamespace,
+			},
+			Data: map[string]string{
+				util.CacheUserAgentsKey: cacheAgents,
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			return false
+		}
+		// waiting for create event
+		time.Sleep(2 * time.Second)
+	}
 	var reqCanCache bool
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		reqCanCache = m.CanCacheFor(req)
@@ -2474,10 +3385,449 @@ func checkReqCanCache(m CacheManager, userAgent, verb, path string, header map[s
 	})
 
 	handler = proxyutil.WithListRequestSelector(handler)
-	handler = proxyutil.WithCacheHeaderCheck(handler)
 	handler = proxyutil.WithRequestClientComponent(handler)
+	handler = proxyutil.WithPartialObjectMetadataRequest(handler)
 	handler = filters.WithRequestInfo(handler, newTestRequestInfoResolver())
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 
 	return reqCanCache
+}
+
+func newTestRequestInfoResolver() *request.RequestInfoFactory {
+	return &request.RequestInfoFactory{
+		APIPrefixes:          sets.NewString("api", "apis"),
+		GrouplessAPIPrefixes: sets.NewString("api"),
+	}
+}
+
+func TestIsListRequestWithNameFieldSelector(t *testing.T) {
+	testcases := map[string]struct {
+		Verb   string
+		Path   string
+		Expect bool
+	}{
+		"request has metadata.name fieldSelector": {
+			Verb:   "GET",
+			Path:   "/api/v1/namespaces/kube-system/pods?resourceVersion=1494416105&fieldSelector=metadata.name=test",
+			Expect: true,
+		},
+		"request has no metadata.name fieldSelector": {
+			Verb:   "GET",
+			Path:   "/api/v1/namespaces/kube-system/pods?resourceVersion=1494416105&fieldSelector=spec.nodeName=test",
+			Expect: false,
+		},
+		"request only has labelSelector": {
+			Verb:   "GET",
+			Path:   "/api/v1/namespaces/kube-system/pods?resourceVersion=1494416105&labelSelector=foo=bar",
+			Expect: false,
+		},
+		"request has both labelSelector and fieldSelector and fieldSelector has metadata.name": {
+			Verb:   "GET",
+			Path:   "/api/v1/namespaces/kube-system/pods?fieldSelector=metadata.name=test&labelSelector=foo=bar",
+			Expect: true,
+		},
+		"request has both labelSelector and fieldSelector but fieldSelector has no metadata.name": {
+			Verb:   "GET",
+			Path:   "/api/v1/namespaces/kube-system/pods?fieldSelector=spec.nodeName=test&labelSelector=foo=bar",
+			Expect: false,
+		},
+	}
+
+	resolver := newTestRequestInfoResolver()
+
+	for k, tc := range testcases {
+		t.Run(k, func(t *testing.T) {
+			req, _ := http.NewRequest(tc.Verb, tc.Path, nil)
+			req.RemoteAddr = "127.0.0.1"
+
+			var isMetadataNameFieldSelector bool
+			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				isMetadataNameFieldSelector = isListRequestWithNameFieldSelector(req)
+			})
+
+			handler = proxyutil.WithListRequestSelector(handler)
+			handler = filters.WithRequestInfo(handler, resolver)
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			if isMetadataNameFieldSelector != tc.Expect {
+				t.Errorf("failed at case %s, want: %v, got: %v", k, tc.Expect, isMetadataNameFieldSelector)
+			}
+		})
+	}
+}
+
+type conflictInjectingStorageWrapper struct {
+	StorageWrapper
+	replaceListStarted    chan struct{}
+	replaceListCanProceed chan struct{}
+	mu                    sync.Mutex
+	replaceListInProgress bool
+}
+
+func newConflictInjectingStorageWrapper(inner StorageWrapper) *conflictInjectingStorageWrapper {
+	return &conflictInjectingStorageWrapper{
+		StorageWrapper:        inner,
+		replaceListStarted:    make(chan struct{}),
+		replaceListCanProceed: make(chan struct{}),
+	}
+}
+
+func (w *conflictInjectingStorageWrapper) ReplaceComponentList(component string, gvr schema.GroupVersionResource, namespace string, contents map[storage.Key]runtime.Object) error {
+	w.mu.Lock()
+	w.replaceListInProgress = true
+	w.mu.Unlock()
+
+	close(w.replaceListStarted)
+	<-w.replaceListCanProceed
+
+	defer func() {
+		w.mu.Lock()
+		w.replaceListInProgress = false
+		w.mu.Unlock()
+	}()
+
+	return w.StorageWrapper.ReplaceComponentList(component, gvr, namespace, contents)
+}
+
+func (w *conflictInjectingStorageWrapper) Update(key storage.Key, obj runtime.Object, rv uint64) (runtime.Object, error) {
+	w.mu.Lock()
+	inProgress := w.replaceListInProgress
+	w.mu.Unlock()
+
+	if inProgress {
+		return nil, storage.ErrStorageAccessConflict
+	}
+	return w.StorageWrapper.Update(key, obj, rv)
+}
+
+func (w *conflictInjectingStorageWrapper) Create(key storage.Key, obj runtime.Object) error {
+	w.mu.Lock()
+	inProgress := w.replaceListInProgress
+	w.mu.Unlock()
+
+	if inProgress {
+		return storage.ErrStorageAccessConflict
+	}
+	return w.StorageWrapper.Create(key, obj)
+}
+
+func TestCacheWatchResponseKeepsInMemoryCacheConsistentWithDiskOnAccessConflict(t *testing.T) {
+	testDir, err := os.MkdirTemp("", "cachemanager-watch-conflict")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(testDir)
+
+	dStorage, err := disk.NewDiskStorage(testDir)
+	if err != nil {
+		t.Fatalf("failed to create disk storage: %v", err)
+	}
+	innerWrapper := NewStorageWrapper(dStorage)
+	conflictWrapper := newConflictInjectingStorageWrapper(innerWrapper)
+	serializerM := serializer.NewSerializerManager()
+
+	restRESTMapperMgr, err := hubmeta.NewRESTMapperManager(testDir)
+	if err != nil {
+		t.Fatalf("failed to create RESTMapper manager: %v", err)
+	}
+
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	yurtCM := NewCacheManager(conflictWrapper, serializerM, restRESTMapperMgr, configManager)
+
+	resolver := newTestRequestInfoResolver()
+	accessor := meta.NewAccessor()
+
+	nodeName := "conflict-node"
+	nodeInitialRV := "10"
+	nodeConflictRV := "20"
+	initialNode := &v1.Node{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Node",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            nodeName,
+			ResourceVersion: nodeInitialRV,
+		},
+	}
+
+	seedReq, _ := http.NewRequest("GET", "/api/v1/nodes/"+nodeName, nil)
+	seedReq.Header.Set("User-Agent", "kubelet")
+	seedReq.Header.Set("Accept", "application/json")
+	seedReq.RemoteAddr = "127.0.0.1"
+
+	var seedHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		info, _ := request.RequestInfoFrom(ctx)
+		reqContentType, _ := util.ReqContentTypeFrom(ctx)
+		ctx = util.WithRespContentType(ctx, reqContentType)
+		req = req.WithContext(ctx)
+
+		gvr := schema.GroupVersionResource{
+			Group:    info.APIGroup,
+			Version:  info.APIVersion,
+			Resource: info.Resource,
+		}
+		s := serializerM.CreateSerializer(reqContentType, gvr.Group, gvr.Version, gvr.Resource)
+		encoder, encErr := s.Encoder(reqContentType, nil)
+		if encErr != nil {
+			t.Fatalf("could not create encoder: %v", encErr)
+		}
+		buf := bytes.NewBuffer([]byte{})
+		if encErr = encoder.Encode(initialNode, buf); encErr != nil {
+			t.Fatalf("could not encode initial node: %v", encErr)
+		}
+		prc := io.NopCloser(buf)
+		if cacheErr := yurtCM.CacheResponse(req, prc, nil); cacheErr != nil {
+			t.Fatalf("seed cache response failed: %v", cacheErr)
+		}
+	})
+	seedHandler = proxyutil.WithRequestContentType(seedHandler)
+	seedHandler = proxyutil.WithRequestClientComponent(seedHandler)
+	seedHandler = filters.WithRequestInfo(seedHandler, resolver)
+	seedHandler.ServeHTTP(httptest.NewRecorder(), seedReq)
+
+	seedKeyInfo := storage.KeyBuildInfo{
+		Component: "kubelet",
+		Resources: "nodes",
+		Group:     "",
+		Version:   "v1",
+		Name:      nodeName,
+	}
+	seedKey, err := innerWrapper.KeyFunc(seedKeyInfo)
+	if err != nil {
+		t.Fatalf("failed to build seed key: %v", err)
+	}
+	seedDiskObj, err := innerWrapper.Get(seedKey)
+	if err != nil {
+		t.Fatalf("failed to get seeded node from disk: %v", err)
+	}
+	seedDiskRV, _ := accessor.ResourceVersion(seedDiskObj)
+	if seedDiskRV != nodeInitialRV {
+		t.Fatalf("seeded disk node rv %q != expected %q", seedDiskRV, nodeInitialRV)
+	}
+
+	listDone := make(chan struct{})
+	listPath := "/api/v1/nodes?watch=false"
+	listReq, _ := http.NewRequest("GET", listPath, nil)
+	listReq.Header.Set("User-Agent", "kubelet")
+	listReq.Header.Set("Accept", "application/json")
+	listReq.RemoteAddr = "127.0.0.1"
+
+	nodeListRV := nodeInitialRV
+	listNodes := []runtime.Object{
+		&v1.Node{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "Node",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            nodeName,
+				ResourceVersion: nodeListRV,
+			},
+		},
+	}
+
+	go func() {
+		defer close(listDone)
+
+		var listHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			ctx := req.Context()
+			info, _ := request.RequestInfoFrom(ctx)
+			reqContentType, _ := util.ReqContentTypeFrom(ctx)
+			ctx = util.WithRespContentType(ctx, reqContentType)
+			req = req.WithContext(ctx)
+
+			gvr := schema.GroupVersionResource{
+				Group:    info.APIGroup,
+				Version:  info.APIVersion,
+				Resource: info.Resource,
+			}
+			listGVK := schema.GroupVersionKind{
+				Group:   gvr.Group,
+				Version: gvr.Version,
+				Kind:    "NodeList",
+			}
+			listObj, listErr := scheme.Scheme.New(listGVK)
+			if listErr != nil {
+				t.Errorf("could not create nodelist: %v", listErr)
+				return
+			}
+			if listErr = meta.SetList(listObj, listNodes); listErr != nil {
+				t.Errorf("could not set list items: %v", listErr)
+				return
+			}
+			if listErr = accessor.SetResourceVersion(listObj, nodeListRV); listErr != nil {
+				t.Errorf("could not set list rv: %v", listErr)
+				return
+			}
+
+			s := serializerM.CreateSerializer(reqContentType, gvr.Group, gvr.Version, gvr.Resource)
+			encoder, encErr := s.Encoder(reqContentType, nil)
+			if encErr != nil {
+				t.Errorf("could not create list encoder: %v", encErr)
+				return
+			}
+			buf := bytes.NewBuffer([]byte{})
+			if encErr = encoder.Encode(listObj, buf); encErr != nil {
+				t.Errorf("could not encode list: %v", encErr)
+				return
+			}
+			prc := io.NopCloser(buf)
+			if cacheErr := yurtCM.CacheResponse(req, prc, nil); cacheErr != nil {
+				t.Errorf("list cache response unexpected err: %v", cacheErr)
+			}
+		})
+		listHandler = proxyutil.WithListRequestSelector(listHandler)
+		listHandler = proxyutil.WithRequestContentType(listHandler)
+		listHandler = proxyutil.WithRequestClientComponent(listHandler)
+		listHandler = filters.WithRequestInfo(listHandler, resolver)
+		listHandler.ServeHTTP(httptest.NewRecorder(), listReq)
+	}()
+
+	<-conflictWrapper.replaceListStarted
+
+	modifiedNode := &v1.Node{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Node",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            nodeName,
+			ResourceVersion: nodeConflictRV,
+		},
+	}
+	watchEvents := []watch.Event{
+		{Type: watch.Modified, Object: modifiedNode},
+	}
+	watchPath := "/api/v1/nodes?watch=true"
+	watchReq, _ := http.NewRequest("GET", watchPath, nil)
+	watchReq.Header.Set("User-Agent", "kubelet")
+	watchReq.Header.Set("Accept", "application/json")
+	watchReq.RemoteAddr = "127.0.0.1"
+
+	var watchHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		info, _ := request.RequestInfoFrom(ctx)
+		comp, _ := util.TruncatedClientComponentFrom(ctx)
+		reqContentType, _ := util.ReqContentTypeFrom(ctx)
+		ctx = util.WithRespContentType(ctx, reqContentType)
+		req = req.WithContext(ctx)
+
+		gvr := schema.GroupVersionResource{
+			Group:    info.APIGroup,
+			Version:  info.APIVersion,
+			Resource: info.Resource,
+		}
+		_ = comp
+		s := serializerM.CreateSerializer(reqContentType, gvr.Group, gvr.Version, gvr.Resource)
+		pr, pw := io.Pipe()
+		go func(pw *io.PipeWriter) {
+			for i := range watchEvents {
+				if _, encErr := s.WatchEncode(pw, &watchEvents[i]); encErr != nil {
+					t.Errorf("watch encode err: %v", encErr)
+				}
+			}
+			pw.Close()
+		}(pw)
+		rc := io.NopCloser(pr)
+		_ = yurtCM.CacheResponse(req, rc, nil)
+	})
+	watchHandler = proxyutil.WithRequestContentType(watchHandler)
+	watchHandler = proxyutil.WithRequestClientComponent(watchHandler)
+	watchHandler = filters.WithRequestInfo(watchHandler, resolver)
+	watchHandler.ServeHTTP(httptest.NewRecorder(), watchReq)
+
+	close(conflictWrapper.replaceListCanProceed)
+	<-listDone
+
+	diskObj, err := innerWrapper.Get(seedKey)
+	if err != nil {
+		t.Fatalf("failed to get final node from disk: %v", err)
+	}
+	diskRV, _ := accessor.ResourceVersion(diskObj)
+
+	queryReq, _ := http.NewRequest("GET", "/api/v1/nodes/"+nodeName, nil)
+	queryReq.Header.Set("User-Agent", "kubelet")
+	queryReq.Header.Set("Accept", "application/json")
+	queryReq.RemoteAddr = "127.0.0.1"
+
+	var queryObj runtime.Object
+	var queryHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		queryObj, err = yurtCM.QueryCache(req)
+	})
+	queryHandler = proxyutil.WithRequestClientComponent(queryHandler)
+	queryHandler = filters.WithRequestInfo(queryHandler, resolver)
+	queryHandler.ServeHTTP(httptest.NewRecorder(), queryReq)
+	if err != nil {
+		t.Fatalf("QueryCache failed: %v", err)
+	}
+	if queryObj == nil {
+		t.Fatalf("QueryCache returned nil object")
+	}
+	queryRV, _ := accessor.ResourceVersion(queryObj)
+
+	if diskRV != queryRV {
+		t.Errorf("in-memory cache and disk are inconsistent: disk rv = %s, QueryCache rv = %s (in-memory cache wrongly applied rv %s)", diskRV, queryRV, nodeConflictRV)
+	}
+}
+
+// TODO: in-memory cache unit tests
+
+func Test_completeListObjWithObjs(t *testing.T) {
+	testcases := map[string]struct {
+		objs       []runtime.Object
+		expectedRv string
+	}{
+		"normal resourceVersion numbers": {
+			objs: []runtime.Object{
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", ResourceVersion: "100"}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", ResourceVersion: "250"}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod3", ResourceVersion: "150"}},
+			},
+			expectedRv: "250",
+		},
+		"large uint64 resourceVersion exceeding 32-bit signed int max": {
+			objs: []runtime.Object{
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", ResourceVersion: "2147483647"}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", ResourceVersion: "3000000000"}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod3", ResourceVersion: "2500000000"}},
+			},
+			expectedRv: "3000000000",
+		},
+		"very large 64-bit unsigned int resourceVersion": {
+			objs: []runtime.Object{
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", ResourceVersion: "18446744073709551600"}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", ResourceVersion: "100"}},
+			},
+			expectedRv: "18446744073709551600",
+		},
+		"empty and invalid resourceVersions handled safely": {
+			objs: []runtime.Object{
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", ResourceVersion: ""}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", ResourceVersion: "invalid"}},
+				&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod3", ResourceVersion: "500"}},
+			},
+			expectedRv: "500",
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			listObj := &v1.PodList{}
+			err := completeListObjWithObjs(listObj, tc.objs)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			accessor := meta.NewAccessor()
+			rv, err := accessor.ResourceVersion(listObj)
+			if err != nil {
+				t.Fatalf("failed to get list object resourceVersion: %v", err)
+			}
+			if rv != tc.expectedRv {
+				t.Errorf("expected list resourceVersion %q, got %q", tc.expectedRv, rv)
+			}
+		})
+	}
 }

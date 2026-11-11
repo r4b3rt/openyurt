@@ -18,114 +18,123 @@ package cachemanager
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"sync"
-
-	"github.com/openyurtio/openyurt/pkg/yurthub/storage"
-	"github.com/openyurtio/openyurt/pkg/yurthub/util"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+
+	"github.com/openyurtio/openyurt/pkg/projectinfo"
+	"github.com/openyurtio/openyurt/pkg/yurthub/storage"
 )
 
 // StorageWrapper is wrapper for storage.Store interface
 // in order to handle serialize runtime object
 type StorageWrapper interface {
-	Create(key string, obj runtime.Object) error
-	Delete(key string) error
-	Get(key string) (runtime.Object, error)
-	ListKeys(key string) ([]string, error)
-	List(key string) ([]runtime.Object, error)
-	Update(key string, obj runtime.Object) error
-	Replace(rootKey string, objs map[string]runtime.Object) error
-	DeleteCollection(rootKey string) error
-	GetRaw(key string) ([]byte, error)
-	UpdateRaw(key string, contents []byte) error
+	Name() string
+	Create(key storage.Key, obj runtime.Object) error
+	Delete(key storage.Key) error
+	Get(key storage.Key) (runtime.Object, error)
+	List(key storage.Key) ([]runtime.Object, error)
+	Update(key storage.Key, obj runtime.Object, rv uint64) (runtime.Object, error)
+	KeyFunc(info storage.KeyBuildInfo) (storage.Key, error)
+	ListResourceKeysOfComponent(component string, gvr schema.GroupVersionResource) ([]storage.Key, error)
+	ReplaceComponentList(component string, gvr schema.GroupVersionResource, namespace string, contents map[storage.Key]runtime.Object) error
+	DeleteComponentResources(component string) error
+	SaveClusterInfo(key storage.Key, content []byte) error
+	GetClusterInfo(key storage.Key) ([]byte, error)
+	GetStorage() storage.Store
+	GetCacheResult() (int, string)
 }
 
 type storageWrapper struct {
 	sync.RWMutex
 	store             storage.Store
+	errorKeys         *errorKeys
 	backendSerializer runtime.Serializer
-	cache             map[string]runtime.Object
 }
 
 // NewStorageWrapper create a StorageWrapper object
 func NewStorageWrapper(storage storage.Store) StorageWrapper {
-	return &storageWrapper{
+	sw := &storageWrapper{
 		store:             storage,
+		errorKeys:         NewErrorKeys("/var/lib/" + projectinfo.GetHubName() + "/autonomy"),
 		backendSerializer: json.NewSerializerWithOptions(json.DefaultMetaFactory, scheme.Scheme, scheme.Scheme, json.SerializerOptions{}),
-		cache:             make(map[string]runtime.Object),
 	}
+	sw.errorKeys.recover()
+	return sw
+}
+
+func (sw *storageWrapper) Name() string {
+	return sw.store.Name()
+}
+
+func (sw *storageWrapper) KeyFunc(info storage.KeyBuildInfo) (storage.Key, error) {
+	return sw.store.KeyFunc(info)
+}
+
+func (sw *storageWrapper) GetStorage() storage.Store {
+	return sw.store
+}
+
+func (sw *storageWrapper) GetCacheResult() (int, string) {
+	return sw.errorKeys.length(), sw.errorKeys.aggregate()
 }
 
 // Create store runtime object into backend storage
 // if obj is nil, the storage used to represent the key
 // will be created. for example: for disk storage,
 // a directory that indicates the key will be created.
-func (sw *storageWrapper) Create(key string, obj runtime.Object) error {
+func (sw *storageWrapper) Create(key storage.Key, obj runtime.Object) error {
 	var buf bytes.Buffer
 	if obj != nil {
 		if err := sw.backendSerializer.Encode(obj, &buf); err != nil {
-			klog.Errorf("failed to encode object in create for %s, %v", key, err)
+			sw.errorKeys.put(key.Key(), err.Error())
+			klog.Errorf("could not encode object in create for %s, %v", key.Key(), err)
 			return err
 		}
 	}
 
 	if err := sw.store.Create(key, buf.Bytes()); err != nil {
+		sw.errorKeys.put(key.Key(), err.Error())
 		return err
 	}
 
-	if obj != nil && isCacheKey(key) {
-		sw.Lock()
-		sw.cache[key] = obj
-		sw.Unlock()
-	}
-
+	sw.errorKeys.del(key.Key())
 	return nil
 }
 
 // Delete remove runtime object that by specified key from backend storage
-func (sw *storageWrapper) Delete(key string) error {
-	if err := sw.store.Delete(key); err != nil {
+func (sw *storageWrapper) Delete(key storage.Key) error {
+	err := sw.store.Delete(key)
+	if err != nil {
+		sw.errorKeys.put(key.Key(), fmt.Sprintf("failed to delete, %v", err.Error()))
 		return err
 	}
-
-	if isCacheKey(key) {
-		sw.Lock()
-		delete(sw.cache, key)
-		sw.Unlock()
-	}
-
+	sw.errorKeys.del(key.Key())
 	return nil
 }
 
 // Get get the runtime object that specified by key from backend storage
-func (sw *storageWrapper) Get(key string) (runtime.Object, error) {
-	cachedKey := isCacheKey(key)
-	if cachedKey {
-		sw.RLock()
-		cachedObject, ok := sw.cache[key]
-		sw.RUnlock()
-		if ok && cachedObject != nil {
-			return cachedObject, nil
-		}
-	}
-
+func (sw *storageWrapper) Get(key storage.Key) (runtime.Object, error) {
 	b, err := sw.store.Get(key)
 	if err != nil {
-		klog.Errorf("could not get object for %s, %v", key, err)
 		return nil, err
 	} else if len(b) == 0 {
 		return nil, nil
 	}
+
 	//get the gvk from json data
 	gvk, err := json.DefaultMetaFactory.Interpret(b)
 	if err != nil {
 		return nil, err
 	}
+
 	var UnstructuredObj runtime.Object
 	if scheme.Scheme.Recognizes(*gvk) {
 		UnstructuredObj = nil
@@ -134,39 +143,27 @@ func (sw *storageWrapper) Get(key string) (runtime.Object, error) {
 	}
 	obj, gvk, err := sw.backendSerializer.Decode(b, nil, UnstructuredObj)
 	if err != nil {
-		klog.Errorf("could not decode %v for %s, %v", gvk, key, err)
+		klog.Errorf("could not decode %v for %s, %v", gvk, key.Key(), err)
 		return nil, err
 	}
 
-	if cachedKey {
-		sw.Lock()
-		sw.cache[key] = obj
-		sw.Unlock()
-	}
 	return obj, nil
 }
 
 // ListKeys list all keys with key as prefix
-func (sw *storageWrapper) ListKeys(key string) ([]string, error) {
-	return sw.store.ListKeys(key)
+func (sw *storageWrapper) ListResourceKeysOfComponent(component string, gvr schema.GroupVersionResource) ([]storage.Key, error) {
+	return sw.store.ListResourceKeysOfComponent(component, gvr)
 }
 
 // List get all of runtime objects that specified by key as prefix
-func (sw *storageWrapper) List(key string) ([]runtime.Object, error) {
+func (sw *storageWrapper) List(key storage.Key) ([]runtime.Object, error) {
 	bb, err := sw.store.List(key)
 	objects := make([]runtime.Object, 0, len(bb))
 	if err != nil {
-		klog.Errorf("could not list objects for %s, %v", key, err)
+		klog.Errorf("could not list objects for %s, %v", key.Key(), err)
 		return nil, err
-	} else if len(bb) == 0 {
-		if isPodKey(key) {
-			// because at least there will be yurt-hub pod on the node.
-			// if no pods in cache, maybe all of pods have been deleted by accident,
-			// if empty object is returned, pods on node will be deleted by kubelet.
-			// in order to prevent the influence to business, return error here so pods
-			// will be kept on node.
-			return objects, storage.ErrStorageNotFound
-		}
+	}
+	if len(bb) == 0 {
 		return objects, nil
 	}
 	//get the gvk from json data
@@ -175,15 +172,19 @@ func (sw *storageWrapper) List(key string) ([]runtime.Object, error) {
 		return nil, err
 	}
 	var UnstructuredObj runtime.Object
+	var recognized bool
 	if scheme.Scheme.Recognizes(*gvk) {
-		UnstructuredObj = nil
-	} else {
-		UnstructuredObj = new(unstructured.Unstructured)
+		recognized = true
 	}
+
 	for i := range bb {
+		if !recognized {
+			UnstructuredObj = new(unstructured.Unstructured)
+		}
+
 		obj, gvk, err := sw.backendSerializer.Decode(bb[i], nil, UnstructuredObj)
 		if err != nil {
-			klog.Errorf("could not decode %v for %s, %v", gvk, key, err)
+			klog.Errorf("could not decode %v for %s, %v", gvk, key.Key(), err)
 			continue
 		}
 		objects = append(objects, obj)
@@ -193,33 +194,53 @@ func (sw *storageWrapper) List(key string) ([]runtime.Object, error) {
 }
 
 // Update update runtime object in backend storage
-func (sw *storageWrapper) Update(key string, obj runtime.Object) error {
+func (sw *storageWrapper) Update(key storage.Key, obj runtime.Object, rv uint64) (runtime.Object, error) {
 	var buf bytes.Buffer
 	if err := sw.backendSerializer.Encode(obj, &buf); err != nil {
-		klog.Errorf("failed to encode object in update for %s, %v", key, err)
-		return err
+		sw.errorKeys.put(key.Key(), err.Error())
+		klog.Errorf("could not encode object in update for %s, %v", key.Key(), err)
+		return nil, err
 	}
 
-	if err := sw.store.Update(key, buf.Bytes()); err != nil {
-		return err
-	}
+	if buf, err := sw.store.Update(key, buf.Bytes(), rv); err != nil {
+		switch err {
+		case storage.ErrStorageNotFound:
+			return nil, err
+		case storage.ErrUpdateConflict:
+			// if error is ErrUpdateConflict, it's no need to record this error into errorKeys,
+			// because only old version object is rejected and there is no affect to the local cache.
+			//get the gvk from json data
+			gvk := obj.GetObjectKind().GroupVersionKind()
 
-	if isCacheKey(key) {
-		sw.Lock()
-		sw.cache[key] = obj
-		sw.Unlock()
+			var UnstructuredObj runtime.Object
+			var dErr error
+			if scheme.Scheme.Recognizes(gvk) {
+				UnstructuredObj = nil
+			} else {
+				UnstructuredObj = new(unstructured.Unstructured)
+			}
+			obj, _, dErr = sw.backendSerializer.Decode(buf, &gvk, UnstructuredObj)
+			if dErr != nil {
+				return nil, fmt.Errorf("could not decode existing obj of key %s, %v", key.Key(), dErr)
+			}
+			return obj, err
+		}
+		sw.errorKeys.put(key.Key(), err.Error())
+		return nil, err
 	}
-
-	return nil
+	sw.errorKeys.del(key.Key())
+	return obj, nil
 }
 
-// Replace will delete the old objects, and use the given objs instead.
-func (sw *storageWrapper) Replace(rootKey string, objs map[string]runtime.Object) error {
+func (sw *storageWrapper) ReplaceComponentList(component string, gvr schema.GroupVersionResource, namespace string, objs map[storage.Key]runtime.Object) error {
 	var buf bytes.Buffer
-	contents := make(map[string][]byte, len(objs))
+	contents := make(map[storage.Key][]byte, len(objs))
 	for key, obj := range objs {
 		if err := sw.backendSerializer.Encode(obj, &buf); err != nil {
-			klog.Errorf("failed to encode object in update for %s, %v", key, err)
+			for k := range objs {
+				sw.errorKeys.put(k.Key(), err.Error())
+			}
+			klog.Errorf("could not encode object in update for %s, %v", key.Key(), err)
 			return err
 		}
 		contents[key] = make([]byte, len(buf.Bytes()))
@@ -227,40 +248,43 @@ func (sw *storageWrapper) Replace(rootKey string, objs map[string]runtime.Object
 		buf.Reset()
 	}
 
-	return sw.store.Replace(rootKey, contents)
+	err := sw.store.ReplaceComponentList(component, gvr, namespace, contents)
+	if err != nil {
+		for key := range objs {
+			sw.errorKeys.put(key.Key(), err.Error())
+		}
+		return err
+	}
+	for key := range objs {
+		sw.errorKeys.del(key.Key())
+	}
+	return nil
 }
 
 // DeleteCollection will delete all objects under rootKey
-func (sw *storageWrapper) DeleteCollection(rootKey string) error {
-	return sw.store.DeleteCollection(rootKey)
-}
-
-// GetRaw get byte data for specified key
-func (sw *storageWrapper) GetRaw(key string) ([]byte, error) {
-	return sw.store.Get(key)
-}
-
-// UpdateRaw update contents(byte date) for specified key
-func (sw *storageWrapper) UpdateRaw(key string, contents []byte) error {
-	return sw.store.Update(key, contents)
-}
-
-// isCacheKey verify runtime object is cached for specified key.
-// in order to accelerate kubelet get node and lease object, we cache them
-func isCacheKey(key string) bool {
-	comp, resource, _, _ := util.SplitKey(key)
-	switch {
-	case comp == "kubelet" && resource == "nodes":
-		return true
-	case comp == "kubelet" && resource == "leases":
-		return true
+func (sw *storageWrapper) DeleteComponentResources(component string) error {
+	err := sw.store.DeleteComponentResources(component)
+	if err != nil {
+		return err
 	}
-
-	return false
+	for key := range sw.errorKeys.keys {
+		if strings.HasPrefix(key, component+"/") {
+			sw.errorKeys.del(key)
+		}
+	}
+	return nil
 }
 
-// isPodKey verify the key is kubelet/pods or not
-func isPodKey(key string) bool {
-	comp, resource, _, _ := util.SplitKey(key)
-	return comp == "kubelet" && resource == "pods"
+func (sw *storageWrapper) SaveClusterInfo(key storage.Key, content []byte) error {
+	err := sw.store.SaveClusterInfo(key, content)
+	if err != nil {
+		sw.errorKeys.put(key.Key(), fmt.Sprintf("failed to store cluster info, %v", err.Error()))
+		return err
+	}
+	sw.errorKeys.del(key.Key())
+	return nil
+}
+
+func (sw *storageWrapper) GetClusterInfo(key storage.Key) ([]byte, error) {
+	return sw.store.GetClusterInfo(key)
 }

@@ -19,14 +19,18 @@ package projectinfo
 import (
 	"fmt"
 	"runtime"
+	"strings"
 )
 
 var (
-	projectPrefix = "yurt"
-	labelPrefix   = "openyurt.io"
-	gitVersion    = "v0.0.0"
-	gitCommit     = "unknown"
-	buildDate     = "1970-01-01T00:00:00Z"
+	projectPrefix       = "yurt"
+	labelPrefix         = "openyurt.io"
+	gitVersion          = "v0.0.0"
+	gitCommit           = "unknown"
+	buildDate           = "1970-01-01T00:00:00Z"
+	maintainingVersions = "unknown"
+	separator           = ","
+	nodePoolLabelKey    = "apps.openyurt.io/nodepool"
 )
 
 func ShortAgentVersion() string {
@@ -45,48 +49,69 @@ func ShortServerVersion() string {
 	return GetServerName() + "/" + gitVersion + "-" + commit
 }
 
+// The project prefix is: yurt
 func GetProjectPrefix() string {
 	return projectPrefix
 }
 
+// Server name: yurttunnel-server
 func GetServerName() string {
 	return projectPrefix + "tunnel-server"
 }
 
+// tunnel server label: yurt-tunnel-server
+func YurtTunnelServerLabel() string {
+	return strings.TrimSuffix(projectPrefix, "-") + "-tunnel-server"
+}
+
+// Agent name: yurttunnel-agent
 func GetAgentName() string {
 	return projectPrefix + "tunnel-agent"
 }
 
-// GetEdgeWorkerLabelKey returns the edge-worker label, which is used to
-// identify if a node is a edge node ("true") or a cloud node ("false")
+// GetEdgeWorkerLabelKey returns the edge-worker label ("openyurt.io/is-edge-worker"),
+// which is used to identify if a node is a edge node ("true") or a cloud node ("false")
 func GetEdgeWorkerLabelKey() string {
 	return labelPrefix + "/is-edge-worker"
 }
 
-// GetHubName returns name of yurthub agent
+// GetHubName returns name of yurthub agent: yurthub
 func GetHubName() string {
 	return projectPrefix + "hub"
 }
 
-// GetEdgeEnableTunnelLabelKey returns the tunnel agent label, which is used
-// to identify if tunnel agent is running on the node or not.
+func ShortHubVersion() string {
+	commit := gitCommit
+	if len(gitCommit) > 7 {
+		commit = gitCommit[:7]
+	}
+	return GetHubName() + "/" + gitVersion + "-" + commit
+}
+
+// GetEdgeEnableTunnelLabelKey returns the tunnel agent label ("openyurt.io/edge-enable-reverseTunnel-client"),
+// which is used to identify if tunnel agent is running on the node or not.
 func GetEdgeEnableTunnelLabelKey() string {
 	return labelPrefix + "/edge-enable-reverseTunnel-client"
 }
 
-// GetTunnelName returns name of tunnel
+// GetTunnelName returns name of tunnel: yurttunnel
 func GetTunnelName() string {
 	return projectPrefix + "tunnel"
 }
 
-// GetYurtControllerManagerName returns name of openyurt controller-manager
-func GetYurtControllerManagerName() string {
-	return projectPrefix + "controller-manager"
+// GetYurtManagerName returns name of openyurt-manager: yurt-manager
+func GetYurtManagerName() string {
+	return "yurt-manager"
 }
 
-// GetYurtAppManagerName returns name of tunnel
-func GetYurtAppManagerName() string {
-	return projectPrefix + "app-manager"
+// GetAutonomyAnnotation returns annotation key for node autonomy
+func GetAutonomyAnnotation() string {
+	return fmt.Sprintf("node.beta.%s/autonomy", labelPrefix)
+}
+
+// GetNodeAutonomyDurationAnnotation returns annotation key for node autonomy duration
+func GetNodeAutonomyDurationAnnotation() string {
+	return fmt.Sprintf("node.%s/autonomy-duration", labelPrefix)
 }
 
 // normalizeGitCommit reserve 7 characters for gitCommit
@@ -98,24 +123,43 @@ func normalizeGitCommit(commit string) string {
 	return commit
 }
 
+// GetNodePoolLabel returns label for specifying nodepool
+func GetNodePoolLabel() string {
+	return nodePoolLabelKey
+}
+
+// GetHubleaderConfigMapName returns the name of the leader ConfigMap for the nodepool
+func GetHubleaderConfigMapName(nodepoolName string) string {
+	return fmt.Sprintf("leader-hub-%s", nodepoolName)
+}
+
+// GetHubLeaderConfigMapLabel returns the label of the leader ConfigMap for the nodepool
+func GetHubLeaderConfigMapLabel() string {
+	return fmt.Sprintf("%s/configmap-name", labelPrefix)
+}
+
 // Info contains version information.
 type Info struct {
-	GitVersion string `json:"gitVersion"`
-	GitCommit  string `json:"gitCommit"`
-	BuildDate  string `json:"buildDate"`
-	GoVersion  string `json:"goVersion"`
-	Compiler   string `json:"compiler"`
-	Platform   string `json:"platform"`
+	GitVersion       string   `json:"gitVersion"`
+	GitCommit        string   `json:"gitCommit"`
+	BuildDate        string   `json:"buildDate"`
+	GoVersion        string   `json:"goVersion"`
+	Compiler         string   `json:"compiler"`
+	Platform         string   `json:"platform"`
+	AllVersions      []string `json:"allVersions"`
+	NodePoolLabelKey string   `json:"nodePoolLabelKey"`
 }
 
 // Get returns the overall codebase version.
 func Get() Info {
 	return Info{
-		GitVersion: gitVersion,
-		GitCommit:  normalizeGitCommit(gitCommit),
-		BuildDate:  buildDate,
-		GoVersion:  runtime.Version(),
-		Compiler:   runtime.Compiler,
-		Platform:   fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		GitVersion:       gitVersion,
+		GitCommit:        normalizeGitCommit(gitCommit),
+		BuildDate:        buildDate,
+		GoVersion:        runtime.Version(),
+		Compiler:         runtime.Compiler,
+		Platform:         fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		AllVersions:      strings.Split(maintainingVersions, separator),
+		NodePoolLabelKey: nodePoolLabelKey,
 	}
 }

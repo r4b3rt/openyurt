@@ -1,0 +1,622 @@
+/*
+Copyright 2024 The OpenYurt Authors.
+Copyright 2017 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package multiplexer
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	discovery "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/registry/rest"
+	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/storage"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
+
+	"github.com/openyurtio/openyurt/cmd/yurthub/app/config"
+	"github.com/openyurtio/openyurt/pkg/yurthub/filter"
+	fakeHealthChecker "github.com/openyurtio/openyurt/pkg/yurthub/healthchecker/fake"
+	"github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/meta"
+	"github.com/openyurtio/openyurt/pkg/yurthub/multiplexer"
+	multiplexerstorage "github.com/openyurtio/openyurt/pkg/yurthub/multiplexer/storage"
+	ctesting "github.com/openyurtio/openyurt/pkg/yurthub/proxy/multiplexer/testing"
+	"github.com/openyurtio/openyurt/pkg/yurthub/proxy/remote"
+	util2 "github.com/openyurtio/openyurt/pkg/yurthub/util"
+)
+
+var (
+	discoveryGV = schema.GroupVersion{Group: "discovery.k8s.io", Version: "v1"}
+
+	endpointSliceGVR = discoveryGV.WithResource("endpointslices")
+)
+
+var mockEndpoints = []discovery.Endpoint{
+	{
+		Addresses: []string{"192.168.0.1"},
+		NodeName:  newStringPointer("node1"),
+	},
+	{
+		Addresses: []string{"192.168.1.1"},
+		NodeName:  newStringPointer("node2"),
+	},
+	{
+		Addresses: []string{"192.168.2.3"},
+		NodeName:  newStringPointer("node3"),
+	},
+}
+
+func mockCacheMap() map[string]storage.Interface {
+	return map[string]storage.Interface{
+		endpointSliceGVR.String(): multiplexerstorage.NewFakeEndpointSliceStorage(
+			[]discovery.EndpointSlice{
+				*newEndpointSlice(metav1.NamespaceSystem, "coredns-12345", "", mockEndpoints),
+				*newEndpointSlice(metav1.NamespaceDefault, "nginx", "", mockEndpoints),
+			},
+		),
+	}
+}
+
+func newEndpointSlice(namespace string, name string, resourceVersion string, endpoints []discovery.Endpoint) *discovery.EndpointSlice {
+	return &discovery.EndpointSlice{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "EndpointSlice",
+			APIVersion: "discovery.k8s.io/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			ResourceVersion: resourceVersion,
+		},
+		Endpoints: endpoints,
+	}
+}
+
+type wrapResponse struct {
+	Done chan struct{}
+	*httptest.ResponseRecorder
+}
+
+func (wr *wrapResponse) Write(buf []byte) (int, error) {
+	l, err := wr.ResponseRecorder.Write(buf)
+	wr.Done <- struct{}{}
+	return l, err
+}
+
+type fakeResourceMultiplexer struct {
+	ready    bool
+	store    rest.Storage
+	storeErr error
+}
+
+func (f *fakeResourceMultiplexer) Ready(gvr *schema.GroupVersionResource) bool {
+	return f.ready
+}
+
+func (f *fakeResourceMultiplexer) ResourceStore(gvr *schema.GroupVersionResource) (rest.Storage, error) {
+	if f.storeErr != nil {
+		return nil, f.storeErr
+	}
+	return f.store, nil
+}
+
+func TestGetReqScopeReturnsErrorForUnknownGVR(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "multiplexer-req-scope")
+	if err != nil {
+		t.Fatalf("failed to make temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	restMapperManager, err := meta.NewRESTMapperManager(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create REST mapper manager: %v", err)
+	}
+
+	sp := &multiplexerProxy{restMapperManager: restMapperManager}
+	unknownGVR := schema.GroupVersionResource{Group: "unknown.example.com", Version: "v1", Resource: "widgets"}
+	_, err = sp.getReqScope(&unknownGVR)
+	assert.Error(t, err)
+}
+
+func TestMultiplexerProxyServeHTTPReturnsOnResourceStoreError(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "multiplexer-resource-store")
+	if err != nil {
+		t.Fatalf("failed to make temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	restMapperManager, err := meta.NewRESTMapperManager(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create REST mapper manager: %v", err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	sp := &multiplexerProxy{
+		requestsMultiplexerManager: &fakeResourceMultiplexer{
+			ready:    true,
+			storeErr: errors.New("storage unavailable"),
+		},
+		restMapperManager: restMapperManager,
+		stop:              stopCh,
+	}
+
+	w := httptest.NewRecorder()
+	req := newEndpointSliceListRequest("/apis/discovery.k8s.io/v1/endpointslices", nil)
+
+	assert.NotPanics(t, func() {
+		sp.ServeHTTP(w, req)
+	})
+	assert.GreaterOrEqual(t, w.Code, http.StatusBadRequest)
+	assert.Contains(t, w.Body.String(), "failed to get rest storage")
+}
+
+func TestMultiplexerProxyServeHTTPReturnsOnGetReqScopeError(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "multiplexer-serve-http")
+	if err != nil {
+		t.Fatalf("failed to make temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	restMapperManager, err := meta.NewRESTMapperManager(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create REST mapper manager: %v", err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	sp := &multiplexerProxy{
+		requestsMultiplexerManager: &fakeResourceMultiplexer{ready: true},
+		restMapperManager:          restMapperManager,
+		stop:                       stopCh,
+	}
+
+	w := httptest.NewRecorder()
+	req := newEndpointSliceListRequest("/apis/unknown.example.com/v1/widgets", nil)
+
+	assert.NotPanics(t, func() {
+		sp.ServeHTTP(w, req)
+	})
+	assert.GreaterOrEqual(t, w.Code, http.StatusBadRequest)
+	assert.Contains(t, w.Body.String(), "failed to get req scope")
+}
+
+func TestShareProxy_ServeHTTP_LIST(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test")
+	if err != nil {
+		t.Fatalf("failed to make temp dir, %v", err)
+	}
+	restMapperManager, _ := meta.NewRESTMapperManager(tmpDir)
+
+	clientset := fake.NewSimpleClientset()
+	factory := informers.NewSharedInformerFactory(clientset, 0)
+
+	poolScopeResources := []schema.GroupVersionResource{
+		{Group: "", Version: "v1", Resource: "services"},
+		{Group: "discovery.k8s.io", Version: "v1", Resource: "endpointslices"},
+	}
+
+	for k, tc := range map[string]struct {
+		objectFilter              filter.ObjectFilter
+		url                       string
+		expectedEndPointSliceList *discovery.EndpointSliceList
+		err                       error
+	}{
+		"test list endpoint slices no filter": {
+			objectFilter:              nil,
+			url:                       "/apis/discovery.k8s.io/v1/endpointslices",
+			expectedEndPointSliceList: expectEndpointSliceListNoFilter(),
+			err:                       nil,
+		},
+		"test list endpoint slice with filter": {
+			objectFilter: &ctesting.IgnoreEndpointslicesWithNodeName{
+				IgnoreNodeName: "node1",
+			},
+			url:                       "/apis/discovery.k8s.io/v1/endpointslices",
+			expectedEndPointSliceList: expectEndpointSliceListWithFilter(),
+			err:                       nil,
+		},
+		"test list endpoint slice with namespace": {
+			objectFilter: &ctesting.IgnoreEndpointslicesWithNodeName{
+				IgnoreNodeName: "node1",
+			},
+			url:                       "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
+			expectedEndPointSliceList: expectEndpointSliceListWithNamespace(),
+			err:                       nil,
+		},
+	} {
+		t.Run(k, func(t *testing.T) {
+			w := &httptest.ResponseRecorder{
+				Body: &bytes.Buffer{},
+			}
+
+			healthChecker := fakeHealthChecker.NewFakeChecker(map[*url.URL]bool{})
+			loadBalancer := remote.NewLoadBalancer("round-robin", []*url.URL{}, nil, nil, healthChecker, nil, context.Background().Done())
+			dsm := multiplexerstorage.NewDummyStorageManager(mockCacheMap())
+			cfg := &config.YurtHubConfiguration{
+				PoolScopeResources:       poolScopeResources,
+				RESTMapperManager:        restMapperManager,
+				SharedFactory:            factory,
+				LoadBalancerForLeaderHub: loadBalancer,
+			}
+			rmm := multiplexer.NewRequestMultiplexerManager(cfg, dsm, healthChecker)
+
+			informerSynced := func() bool {
+				return rmm.Ready(&schema.GroupVersionResource{
+					Group:    "discovery.k8s.io",
+					Version:  "v1",
+					Resource: "endpointslices",
+				})
+			}
+			stopCh := make(chan struct{})
+			if ok := cache.WaitForCacheSync(stopCh, informerSynced); !ok {
+				t.Errorf("configuration manager is not ready")
+				return
+			}
+
+			sp := NewMultiplexerProxy(rmm, restMapperManager, make(<-chan struct{}))
+
+			sp.ServeHTTP(w, newEndpointSliceListRequest(tc.url, tc.objectFilter))
+
+			result := equalEndpointSliceLists(tc.expectedEndPointSliceList, decodeEndpointSliceList(w.Body.Bytes()))
+			assert.True(t, result, w.Body.String())
+		})
+	}
+}
+
+func expectEndpointSliceListNoFilter() *discovery.EndpointSliceList {
+	return &discovery.EndpointSliceList{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "List",
+			APIVersion: "v1",
+		},
+		ListMeta: metav1.ListMeta{
+			ResourceVersion: "100",
+		},
+		Items: []discovery.EndpointSlice{
+			*newEndpointSlice(metav1.NamespaceSystem, "coredns-12345", "", mockEndpoints),
+			*newEndpointSlice(metav1.NamespaceDefault, "nginx", "", mockEndpoints),
+		},
+	}
+}
+
+func newStringPointer(str string) *string {
+	return &str
+}
+
+func expectEndpointSliceListWithFilter() *discovery.EndpointSliceList {
+	endpoints := []discovery.Endpoint{
+		{
+			Addresses: []string{"192.168.1.1"},
+			NodeName:  newStringPointer("node2"),
+		},
+		{
+			Addresses: []string{"192.168.2.3"},
+			NodeName:  newStringPointer("node3"),
+		},
+	}
+
+	return &discovery.EndpointSliceList{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "List",
+			APIVersion: "v1",
+		},
+		ListMeta: metav1.ListMeta{
+			ResourceVersion: "100",
+		},
+		Items: []discovery.EndpointSlice{
+			*newEndpointSlice(metav1.NamespaceSystem, "coredns-12345", "", endpoints),
+			*newEndpointSlice(metav1.NamespaceDefault, "nginx", "", endpoints),
+		},
+	}
+}
+
+func expectEndpointSliceListWithNamespace() *discovery.EndpointSliceList {
+	endpoints := []discovery.Endpoint{
+		{
+			Addresses: []string{"192.168.1.1"},
+			NodeName:  newStringPointer("node2"),
+		},
+		{
+			Addresses: []string{"192.168.2.3"},
+			NodeName:  newStringPointer("node3"),
+		},
+	}
+
+	return &discovery.EndpointSliceList{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "List",
+			APIVersion: "v1",
+		},
+		ListMeta: metav1.ListMeta{
+			ResourceVersion: "100",
+		},
+		Items: []discovery.EndpointSlice{
+			*newEndpointSlice(metav1.NamespaceDefault, "nginx", "", endpoints),
+		},
+	}
+}
+
+func newEndpointSliceListRequest(url string, objectFilter filter.ObjectFilter) *http.Request {
+	req := httptest.NewRequest("GET", url, &bytes.Buffer{})
+	ctx := req.Context()
+
+	ctx = request.WithRequestInfo(ctx, resolverRequestInfo(req))
+	if objectFilter != nil {
+		ctx = util2.WithObjectFilter(ctx, objectFilter)
+	}
+
+	req = req.WithContext(ctx)
+
+	return req
+}
+
+func resolverRequestInfo(req *http.Request) *request.RequestInfo {
+	cfg := &server.Config{
+		LegacyAPIGroupPrefixes: sets.NewString(server.DefaultLegacyAPIPrefix),
+	}
+	resolver := server.NewRequestInfoResolver(cfg)
+	info, _ := resolver.NewRequestInfo(req)
+	return info
+}
+
+func decodeEndpointSliceList(b []byte) *discovery.EndpointSliceList {
+	discoveryv1Codec := scheme.Codecs.CodecForVersions(scheme.Codecs.LegacyCodec(discoveryGV), scheme.Codecs.UniversalDecoder(discoveryGV), discoveryGV, discoveryGV)
+
+	epsList := &discovery.EndpointSliceList{}
+	err := runtime.DecodeInto(discoveryv1Codec, b, epsList)
+	if err != nil {
+		return nil
+	}
+	return epsList
+}
+
+func TestShareProxy_ServeHTTP_WATCH(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test")
+	if err != nil {
+		t.Fatalf("failed to make temp dir, %v", err)
+	}
+	restMapperManager, _ := meta.NewRESTMapperManager(tmpDir)
+
+	poolScopeResources := []schema.GroupVersionResource{
+		{Group: "", Version: "v1", Resource: "services"},
+		{Group: "discovery.k8s.io", Version: "v1", Resource: "endpointslices"},
+	}
+
+	clientset := fake.NewSimpleClientset()
+	factory := informers.NewSharedInformerFactory(clientset, 0)
+
+	for k, tc := range map[string]struct {
+		objectFilter       filter.ObjectFilter
+		url                string
+		expectedWatchEvent *metav1.WatchEvent
+		err                error
+	}{
+		"test watch endpointslice no filter": {
+			objectFilter:       nil,
+			url:                "/apis/discovery.k8s.io/v1/endpointslices?watch=true&&resourceVersion=100&&timeoutSeconds=3",
+			expectedWatchEvent: expectedWatchEventNoFilter(),
+			err:                nil,
+		},
+		"test watch endpointslice with filter": {
+			objectFilter: &ctesting.IgnoreEndpointslicesWithNodeName{
+				IgnoreNodeName: "node1",
+			},
+			url:                "/apis/discovery.k8s.io/v1/endpointslices?watch=true&&resourceVersion=100&&timeoutSeconds=3",
+			expectedWatchEvent: expectedWatchEventWithFilter(),
+			err:                nil,
+		},
+	} {
+		t.Run(k, func(t *testing.T) {
+			healthChecker := fakeHealthChecker.NewFakeChecker(map[*url.URL]bool{})
+			loadBalancer := remote.NewLoadBalancer("round-robin", []*url.URL{}, nil, nil, healthChecker, nil, context.Background().Done())
+
+			dsm := multiplexerstorage.NewDummyStorageManager(mockCacheMap())
+			cfg := &config.YurtHubConfiguration{
+				PoolScopeResources:       poolScopeResources,
+				RESTMapperManager:        restMapperManager,
+				SharedFactory:            factory,
+				LoadBalancerForLeaderHub: loadBalancer,
+			}
+			rmm := multiplexer.NewRequestMultiplexerManager(cfg, dsm, healthChecker)
+
+			informerSynced := func() bool {
+				return rmm.Ready(&schema.GroupVersionResource{
+					Group:    "discovery.k8s.io",
+					Version:  "v1",
+					Resource: "endpointslices",
+				})
+			}
+			stopCh := make(chan struct{})
+			if ok := cache.WaitForCacheSync(stopCh, informerSynced); !ok {
+				t.Errorf("configuration manager is not ready")
+				return
+			}
+
+			sp := NewMultiplexerProxy(rmm, restMapperManager, make(<-chan struct{}))
+
+			req := newWatchEndpointSliceRequest(tc.url, tc.objectFilter)
+			w := newWatchResponse()
+
+			go func() {
+				sp.ServeHTTP(w, req)
+			}()
+			generateWatchEvent(dsm)
+
+			assertWatchResp(t, tc.expectedWatchEvent, w)
+		})
+	}
+}
+
+func expectedWatchEventNoFilter() *metav1.WatchEvent {
+	return &metav1.WatchEvent{
+		Type: "ADDED",
+		Object: runtime.RawExtension{
+			Object: newEndpointSlice(metav1.NamespaceSystem, "coredns-23456", "101", mockEndpoints),
+		},
+	}
+}
+
+func expectedWatchEventWithFilter() *metav1.WatchEvent {
+	endpoints := []discovery.Endpoint{
+		{
+			Addresses: []string{"192.168.1.1"},
+			NodeName:  newStringPointer("node2"),
+		},
+		{
+			Addresses: []string{"192.168.2.3"},
+			NodeName:  newStringPointer("node3"),
+		},
+	}
+	return &metav1.WatchEvent{
+		Type: "ADDED",
+		Object: runtime.RawExtension{
+			Object: newEndpointSlice(metav1.NamespaceSystem, "coredns-23456", "101", endpoints),
+		},
+	}
+}
+
+func newWatchEndpointSliceRequest(url string, objectFilter filter.ObjectFilter) *http.Request {
+	req := httptest.NewRequest("GET", url, &bytes.Buffer{})
+
+	ctx := req.Context()
+	ctx = request.WithRequestInfo(ctx, resolverRequestInfo(req))
+	if objectFilter != nil {
+		ctx = util2.WithObjectFilter(ctx, objectFilter)
+	}
+
+	req = req.WithContext(ctx)
+
+	return req
+}
+
+func newWatchResponse() *wrapResponse {
+	return &wrapResponse{
+		make(chan struct{}),
+		&httptest.ResponseRecorder{
+			Body: &bytes.Buffer{},
+		},
+	}
+}
+
+func generateWatchEvent(sp multiplexerstorage.StorageProvider) {
+	fs, err := sp.ResourceStorage(&endpointSliceGVR)
+	if err != nil {
+		return
+	}
+
+	fess, ok := fs.(*multiplexerstorage.FakeEndpointSliceStorage)
+	if ok {
+		fess.AddWatchObject(newEndpointSlice(metav1.NamespaceSystem, "coredns-23456", "102", mockEndpoints))
+	}
+}
+
+func assertWatchResp(t testing.TB, expectedWatchEvent *metav1.WatchEvent, w *wrapResponse) {
+	t.Helper()
+
+	select {
+	case <-time.After(5 * time.Second):
+		t.Errorf("wait watch timeout")
+	case <-w.Done:
+		assert.Equal(t, string(encodeWatchEventList(expectedWatchEvent)), w.Body.String())
+	}
+}
+
+func encodeWatchEventList(watchEvent *metav1.WatchEvent) []byte {
+	metav1Codec := scheme.Codecs.CodecForVersions(scheme.Codecs.LegacyCodec(discoveryGV), scheme.Codecs.UniversalDecoder(discoveryGV), discoveryGV, discoveryGV)
+
+	str := runtime.EncodeOrDie(metav1Codec, watchEvent)
+	return []byte(str)
+}
+
+func equalEndpointSlice(a, b discovery.EndpointSlice) bool {
+	if len(a.Endpoints) != len(b.Endpoints) {
+		return false
+	}
+
+	countA := make(map[string]int)
+	for _, endpoint := range a.Endpoints {
+		key := endpointKey(endpoint)
+		countA[key]++
+	}
+
+	for _, endpoint := range b.Endpoints {
+		key := endpointKey(endpoint)
+		if countA[key] == 0 {
+			return false
+		}
+
+		countA[key]--
+		if countA[key] == 0 {
+			delete(countA, key)
+		}
+	}
+
+	return len(countA) == 0
+}
+
+func endpointKey(endpoint discovery.Endpoint) string {
+	return fmt.Sprintf("%v/%s", endpoint.Addresses, *endpoint.NodeName)
+}
+
+func equalEndpointSliceLists(a, b *discovery.EndpointSliceList) bool {
+	if len(a.Items) != len(b.Items) {
+		return false
+	}
+
+	sort.Slice(a.Items, func(i, j int) bool {
+		return endpointSliceKey(a.Items[i]) < endpointSliceKey(a.Items[j])
+	})
+	sort.Slice(b.Items, func(i, j int) bool {
+		return endpointSliceKey(b.Items[i]) < endpointSliceKey(b.Items[j])
+	})
+
+	for i := range a.Items {
+		if !equalEndpointSlice(a.Items[i], b.Items[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func endpointSliceKey(slice discovery.EndpointSlice) string {
+	keys := make([]string, len(slice.Endpoints))
+	for i, endpoint := range slice.Endpoints {
+		keys[i] = endpointKey(endpoint)
+	}
+	sort.Strings(keys)
+	return fmt.Sprint(keys)
+}

@@ -1,0 +1,226 @@
+/*
+Copyright 2020 The OpenYurt Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package yurthub
+
+import (
+	"fmt"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	"k8s.io/klog/v2"
+
+	"github.com/openyurtio/openyurt/test/e2e/constants"
+)
+
+var (
+	Edge2NginxPodIP  string
+	NginxServiceIP   string
+	CoreDNSServiceIP string
+
+	flannelContainerID   string
+	kubeProxyContainerID string
+	coreDNSContainerID   string
+	nginxContainerID     string
+)
+
+var _ = ginkgo.Describe("edge-autonomy"+constants.YurtE2ENamespaceName, ginkgo.Ordered, ginkgo.Label("edge-autonomy"), func() {
+	defer ginkgo.GinkgoRecover()
+	var _ = ginkgo.Describe("kubelet"+constants.YurtE2ENamespaceName, func() {
+		ginkgo.It("kubelet edge-autonomy test", ginkgo.Label("edge-autonomy"), func() {
+			// restart kubelet using systemctl restart kubelet in edge nodes；
+			_, err := exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c 'systemctl restart kubelet'").CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to restart kubelet")
+			// check periodically if kubelet restarted
+			gomega.Eventually(func() bool {
+				opBytes, err := exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c 'curl -m 2 http://127.0.0.1:10248/healthz'").CombinedOutput()
+				if err != nil {
+					return false
+				}
+				if string(opBytes) == "ok" {
+					return true
+				} else {
+					return false
+				}
+			}).WithTimeout(10*time.Second).WithPolling(1*time.Second).Should(gomega.BeTrue(), "fail to check kubelet health")
+			//check periodically if nginx restarted successfully
+			gomega.Eventually(func() string {
+				opBytes, err := exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c 'curl -m 2 http://127.0.0.1:80'").CombinedOutput()
+				if err != nil {
+					return ""
+				}
+				return string(opBytes)
+			}).WithTimeout(10*time.Second).WithPolling(1*time.Second).Should(gomega.ContainSubstring("nginx"), "nginx pod not running")
+		})
+	})
+
+	var _ = ginkgo.Describe("flannel"+constants.YurtE2ENamespaceName, func() {
+		ginkgo.It("flannel edge-autonomy test", ginkgo.Label("edge-autonomy"), func() {
+			// obtain flannel containerID with crictl
+			cmd := `docker exec -t openyurt-e2e-test-worker /bin/bash -c "crictl ps | grep kube-flannel | awk '{print \$1}'"`
+			opBytes, err := exec.Command("/bin/bash", "-c", cmd).CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to get flannel container ID")
+			flannelContainerID = strings.TrimSpace(string(opBytes))
+
+			// restart flannel - check if container is already stopped before attempting to stop
+			checkCmd := `docker exec -t openyurt-e2e-test-worker /bin/bash -c "crictl ps | grep ` + flannelContainerID + ` || true"`
+			checkBytes, _ := exec.Command("/bin/bash", "-c", checkCmd).CombinedOutput()
+			if strings.Contains(string(checkBytes), flannelContainerID) {
+				// Container is running, stop it with retries
+				stopCmd := fmt.Sprintf("docker exec -t openyurt-e2e-test-worker /bin/bash -c 'crictl stop %s'", flannelContainerID)
+				var stopErr error
+				for attempt := 1; attempt <= 3; attempt++ {
+					_, stopErr = exec.Command("/bin/bash", "-c", stopCmd).CombinedOutput()
+					if stopErr == nil {
+						break
+					}
+					klog.Errorf("attempt %d/3 fail to stop flannel: %v", attempt, stopErr)
+					if attempt < 3 {
+						time.Sleep(1 * time.Second)
+					}
+				}
+				gomega.Expect(stopErr).NotTo(gomega.HaveOccurred(), fmt.Sprintf("fail to stop flannel after 3 attempts: %v", stopErr))
+			}
+			// If container is already stopped, that's acceptable - continue with test
+
+			// obtain nginx containerID with crictl
+			cmd = `docker exec -t openyurt-e2e-test-worker /bin/bash -c "crictl ps | grep yurt-e2e-test-nginx | awk '{print \$1}'"`
+			opBytes, err = exec.Command("/bin/bash", "-c", cmd).CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to get nginx container ID")
+			nginxContainerID = strings.TrimSpace(string(opBytes))
+
+			// curl pod on another edge node using podIP, periodically
+			gomega.Eventually(func() string {
+				curlCmd := "curl -m 2 " + Edge2NginxPodIP
+				crictlCmd := "crictl exec -it " + nginxContainerID + " " + curlCmd
+				dockerCmd := `docker exec -t openyurt-e2e-test-worker /bin/bash -c ` + "'" + crictlCmd + "'"
+				opBytes, err := exec.Command("/bin/bash", "-c", dockerCmd).CombinedOutput()
+				if err != nil {
+					return ""
+				}
+				return string(opBytes)
+			}).WithTimeout(10*time.Second).WithPolling(1*time.Second).Should(gomega.ContainSubstring("nginx"), "fail to curl worker2 nginx PodIP from nginx on worker1")
+		})
+	})
+
+	var _ = ginkgo.Describe("yurthub"+constants.YurtE2ENamespaceName, func() {
+		ginkgo.It("yurthub edge-autonomy test", ginkgo.Label("edge-autonomy"), func() {
+			getYurthubMainPID := func() string {
+				dockerCmd := "docker exec -t " + constants.YurtE2EWorkerNodeName + " /bin/bash -c 'systemctl show --property MainPID --value yurthub.service'"
+				opBytes, err := exec.Command("/bin/bash", "-c", dockerCmd).CombinedOutput()
+				if err != nil {
+					klog.Errorf("failed to get yurthub main pid, output=%s err=%v", strings.TrimSpace(string(opBytes)), err)
+					return ""
+				}
+				return strings.TrimSpace(string(opBytes))
+			}
+
+			oldPID := getYurthubMainPID()
+			gomega.Expect(oldPID).NotTo(gomega.Or(gomega.BeEmpty(), gomega.Equal("0")), "fail to get yurthub main pid")
+
+			// Kill the main process and rely on systemd Restart=always to bring Yurthub back.
+			dockerCmd := "docker exec -t " + constants.YurtE2EWorkerNodeName + " /bin/bash -c 'systemctl kill --signal=SIGKILL --kill-who=main yurthub.service'"
+			opBytes, err := exec.Command("/bin/bash", "-c", dockerCmd).CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to kill yurthub main process: %s", strings.TrimSpace(string(opBytes)))
+
+			gomega.Eventually(func() string {
+				return getYurthubMainPID()
+			}).WithTimeout(30*time.Second).WithPolling(1*time.Second).ShouldNot(
+				gomega.Or(gomega.BeEmpty(), gomega.Equal("0"), gomega.Equal(oldPID)),
+				"fail to observe yurthub service restart",
+			)
+
+			gomega.Eventually(func() bool {
+				dockerCmd := "docker exec -t " + constants.YurtE2EWorkerNodeName + " /bin/bash -c 'systemctl is-active --quiet yurthub.service'"
+				opBytes, err := exec.Command("/bin/bash", "-c", dockerCmd).CombinedOutput()
+				if err != nil {
+					klog.Infof("yurthub service is not active yet, output=%s err=%v", strings.TrimSpace(string(opBytes)), err)
+					return false
+				}
+				return true
+			}).WithTimeout(30*time.Second).WithPolling(1*time.Second).Should(gomega.BeTrue(), "fail to restart yurthub service")
+
+			// check yurthub health
+			gomega.Eventually(func() bool {
+				opBytes, err := exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c 'curl -m 2 http://127.0.0.1:10267/v1/healthz'").CombinedOutput()
+				if err != nil {
+					return false
+				}
+				if strings.Contains(string(opBytes), "OK") {
+					return true
+				} else {
+					return false
+				}
+			}).WithTimeout(120*time.Second).WithPolling(1*time.Second).Should(gomega.BeTrue(), "fail to check yurthub health")
+		})
+	})
+
+	var _ = ginkgo.Describe("kube-proxy"+constants.YurtE2ENamespaceName, func() {
+		ginkgo.It("kube-proxy edge-autonomy test", ginkgo.Label("edge-autonomy"), func() {
+			// obtain kube-proxy containerID with crictl
+			cmd := `docker exec -t openyurt-e2e-test-worker /bin/bash -c "crictl ps | grep kube-proxy | awk '{print \$1}'"`
+			opBytes, err := exec.Command("/bin/bash", "-c", cmd).CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to get kube-proxy container ID")
+			kubeProxyContainerID = strings.TrimSpace(string(opBytes))
+
+			// delete created iptables related to NginxService, to see if kube-proxy will generate new ones and delegate services
+			_, err = exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c \"iptables-save | sed '/"+constants.NginxServiceName+"/d' | iptables-restore\"").CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to remove iptables on node openyurt-e2e-test-worker")
+
+			// restart kube-proxy
+			_, err = exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c 'crictl stop "+kubeProxyContainerID+"'").CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to stop kube-proxy")
+
+			// check periodically if kube-proxy guided the service request to actual pod
+			gomega.Eventually(func() string {
+				opBytes, err := exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c 'curl -m 2 "+NginxServiceIP+"'").CombinedOutput()
+				if err != nil {
+					klog.Errorf("failed to curl nginx service cluster ip %v", err)
+					return ""
+				}
+				return string(opBytes)
+			}).WithTimeout(10*time.Second).WithPolling(1*time.Second).Should(gomega.ContainSubstring("nginx"), "fail to read curl response from service: "+constants.NginxServiceName)
+		})
+	})
+
+	var _ = ginkgo.Describe("coredns"+constants.YurtE2ENamespaceName, func() {
+		ginkgo.It("coredns edge-autonomy test", ginkgo.Label("edge-autonomy"), func() {
+			// obtain coredns containerID with crictl on edge node1
+			cmd := `docker exec -t openyurt-e2e-test-worker /bin/bash -c "crictl ps | grep coredns | awk '{print \$1}'"`
+			opBytes, err := exec.Command("/bin/bash", "-c", cmd).CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to get coredns container ID")
+			coreDNSContainerID = strings.TrimSpace(string(opBytes))
+
+			// restart coredns
+			_, err = exec.Command("/bin/bash", "-c", "docker exec -t openyurt-e2e-test-worker /bin/bash -c 'crictl stop "+coreDNSContainerID+"'").CombinedOutput()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to stop coredns")
+
+			// check periodically if coredns is able of dns resolution
+			gomega.Eventually(func() string {
+				cmd := fmt.Sprintf("docker exec -t openyurt-e2e-test-worker /bin/bash -c 'dig @%s %s.%s.svc.cluster.local'", CoreDNSServiceIP, constants.NginxServiceName, constants.YurtDefaultNamespaceName)
+				opBytes, err := exec.Command("/bin/bash", "-c", cmd).CombinedOutput()
+				if err != nil {
+					klog.Errorf("failed to execute dig command for coredns, %v", err)
+					return ""
+				}
+				return string(opBytes)
+			}).WithTimeout(60*time.Second).WithPolling(1*time.Second).Should(gomega.ContainSubstring("NOERROR"), "DNS resolution contains error, coreDNS dig failed")
+		})
+	})
+})

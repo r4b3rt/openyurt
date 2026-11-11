@@ -17,277 +17,286 @@ limitations under the License.
 package remote
 
 import (
+	"context"
+	"net/http"
 	"net/url"
+	"sort"
 	"testing"
 
-	"github.com/openyurtio/openyurt/pkg/yurthub/healthchecker"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
+
+	fakeHealthChecker "github.com/openyurtio/openyurt/pkg/yurthub/healthchecker/fake"
+	"github.com/openyurtio/openyurt/pkg/yurthub/transport"
 )
 
-type PickBackend struct {
-	DeltaRequestsCnt int
-	ReturnServer     string
-}
+var (
+	neverStop    <-chan struct{}     = context.Background().Done()
+	transportMgr transport.Interface = transport.NewFakeTransportManager(
+		http.StatusOK,
+		map[string]kubernetes.Interface{},
+	)
+)
 
-func TestRrLoadBalancerAlgo(t *testing.T) {
-	testcases := map[string]struct {
-		Servers      []string
-		PickBackends []PickBackend
-	}{
-		"no backend servers": {
-			Servers: []string{},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: ""},
-			},
-		},
-
-		"one backend server": {
-			Servers: []string{"http://127.0.0.1:8080"},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-			},
-		},
-
-		"multi backend server": {
-			Servers: []string{"http://127.0.0.1:8080", "http://127.0.0.1:8081", "http://127.0.0.1:8082"},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 2, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 3, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 4, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 4, ReturnServer: "http://127.0.0.1:8081"},
-				{DeltaRequestsCnt: 4, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 5, ReturnServer: "http://127.0.0.1:8081"},
-				{DeltaRequestsCnt: 5, ReturnServer: "http://127.0.0.1:8080"},
-			},
-		},
-	}
-
-	checker := healthchecker.NewFakeChecker(true, map[string]int{})
-	for k, tc := range testcases {
-		backends := make([]*RemoteProxy, len(tc.Servers))
-		for i := range tc.Servers {
-			u, _ := url.Parse(tc.Servers[i])
-			backends[i] = &RemoteProxy{
-				remoteServer: u,
-				checker:      checker,
-			}
-		}
-
-		rr := &rrLoadBalancerAlgo{
-			backends: backends,
-		}
-
-		for i := range tc.PickBackends {
-			var b *RemoteProxy
-			for j := 0; j < tc.PickBackends[i].DeltaRequestsCnt; j++ {
-				b = rr.PickOne()
-			}
-
-			if len(tc.PickBackends[i].ReturnServer) == 0 {
-				if b != nil {
-					t.Errorf("%s rr lb pick: expect no backend server, but got %s", k, b.remoteServer.String())
-				}
-			} else {
-				if b == nil {
-					t.Errorf("%s rr lb pick: expect backend server: %s, but got no backend server", k, tc.PickBackends[i].ReturnServer)
-				} else if b.remoteServer.String() != tc.PickBackends[i].ReturnServer {
-					t.Errorf("%s rr lb pick(round %d): expect backend server: %s, but got %s", k, i+1, tc.PickBackends[i].ReturnServer, b.remoteServer.String())
-				}
-			}
-		}
-	}
-}
-
-func TestRrLoadBalancerAlgoWithReverseHealthy(t *testing.T) {
-	testcases := map[string]struct {
-		Servers      []string
-		PickBackends []PickBackend
-	}{
-		"multi backend server": {
-			Servers: []string{"http://127.0.0.1:8080", "http://127.0.0.1:8081", "http://127.0.0.1:8082"},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8081"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8081"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-			},
-		},
-	}
-
-	checker := healthchecker.NewFakeChecker(true, map[string]int{
-		"http://127.0.0.1:8080": 1,
-		"http://127.0.0.1:8081": 2,
+func sortURLs(urls []*url.URL) {
+	sort.Slice(urls, func(i, j int) bool {
+		return urls[i].Host < urls[j].Host
 	})
+}
+
+func TestLoadBalancingStrategy(t *testing.T) {
+	testcases := map[string]struct {
+		lbMode  string
+		servers map[*url.URL]bool
+		req     []*http.Request
+		results []string
+	}{
+		"round-robin: no backend server": {
+			lbMode:  roundRobinStrategy,
+			servers: map[*url.URL]bool{},
+			results: []string{""},
+		},
+		"round-robin: one backend server": {
+			lbMode: roundRobinStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: true,
+			},
+			results: []string{"127.0.0.1:8080", "127.0.0.1:8080"},
+		},
+		"round-robin: multiple backend servers": {
+			lbMode: roundRobinStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: true,
+				{Host: "127.0.0.1:8081"}: true,
+				{Host: "127.0.0.1:8082"}: true,
+				{Host: "127.0.0.1:8083"}: true,
+			},
+			results: []string{
+				"127.0.0.1:8080",
+				"127.0.0.1:8081",
+				"127.0.0.1:8082",
+				"127.0.0.1:8083",
+				"127.0.0.1:8080",
+			},
+		},
+		"round-robin: multiple backend servers with unhealthy server": {
+			lbMode: roundRobinStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: true,
+				{Host: "127.0.0.1:8081"}: false,
+				{Host: "127.0.0.1:8082"}: true,
+			},
+			results: []string{
+				"127.0.0.1:8080",
+				"127.0.0.1:8082",
+				"127.0.0.1:8080",
+			},
+		},
+		"round-robin: all of backend servers are unhealthy": {
+			lbMode: roundRobinStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: false,
+				{Host: "127.0.0.1:8081"}: false,
+				{Host: "127.0.0.1:8082"}: false,
+			},
+			results: []string{
+				"",
+				"",
+				"",
+				"",
+			},
+		},
+		"priority: no backend server": {
+			lbMode:  priorityStrategy,
+			servers: map[*url.URL]bool{},
+			results: []string{""},
+		},
+		"priority: one backend server": {
+			lbMode: priorityStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: true,
+			},
+			results: []string{"127.0.0.1:8080", "127.0.0.1:8080"},
+		},
+		"priority: multiple backend servers": {
+			lbMode: priorityStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: true,
+				{Host: "127.0.0.1:8081"}: true,
+				{Host: "127.0.0.1:8082"}: true,
+			},
+			results: []string{
+				"127.0.0.1:8080",
+				"127.0.0.1:8080",
+				"127.0.0.1:8080",
+				"127.0.0.1:8080",
+			},
+		},
+		"priority: multiple backend servers with unhealthy server": {
+			lbMode: priorityStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: false,
+				{Host: "127.0.0.1:8081"}: false,
+				{Host: "127.0.0.1:8082"}: true,
+			},
+			results: []string{
+				"127.0.0.1:8082",
+				"127.0.0.1:8082",
+				"127.0.0.1:8082",
+			},
+		},
+		"priority: all of backend servers are unhealthy": {
+			lbMode: priorityStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: false,
+				{Host: "127.0.0.1:8081"}: false,
+				{Host: "127.0.0.1:8082"}: false,
+			},
+			results: []string{
+				"",
+				"",
+				"",
+				"",
+			},
+		},
+		"consistent-hashing: no backend server": {
+			lbMode:  consistentHashingStrategy,
+			servers: map[*url.URL]bool{},
+			results: []string{""},
+		},
+		"consistent-hashing: one backend server": {
+			lbMode: consistentHashingStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}: true,
+			},
+			results: []string{"127.0.0.1:8080", "127.0.0.1:8080"},
+		},
+		"consistent-hashing: multiple backend servers": {
+			lbMode: consistentHashingStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}:   true,
+				{Host: "192.168.0.1:8081"}: true,
+				{Host: "10.0.0.1:8082"}:    true,
+			},
+			req: []*http.Request{
+				{
+					Header: map[string][]string{
+						"User-Agent": {"user-agent-1"},
+					},
+					RequestURI: "/path-1",
+				},
+				{
+					Header: map[string][]string{
+						"User-Agent": {"Chrome/109.0.0.0"},
+					},
+					RequestURI: "/resource-foobarbaz",
+				},
+				{
+					Header: map[string][]string{
+						"User-Agent": {"CoreDNS/1.6.0"},
+					},
+					RequestURI: "/foobarbaz-resource",
+				},
+				{
+					Header: map[string][]string{
+						"User-Agent": {"curl"},
+					},
+					RequestURI: "/baz-resource",
+				},
+			},
+			results: []string{
+				"127.0.0.1:8080",
+				"192.168.0.1:8081",
+				"127.0.0.1:8080",
+				"10.0.0.1:8082",
+			},
+		},
+		"consistent-hashing: multiple backend servers with unhealthy server": {
+			lbMode: consistentHashingStrategy,
+			servers: map[*url.URL]bool{
+				{Host: "127.0.0.1:8080"}:   false,
+				{Host: "192.168.0.1:8081"}: false,
+				{Host: "10.0.0.1:8082"}:    true,
+			},
+			req: []*http.Request{
+				{
+					Header:     map[string][]string{"User-Agent": {"user-agent-1"}},
+					RequestURI: "/path-1",
+				},
+				{
+					Header:     map[string][]string{"User-Agent": {"Chrome/109.0.0.0"}},
+					RequestURI: "/resource-foobarbaz",
+				},
+				{
+					Header:     map[string][]string{"User-Agent": {"CoreDNS/1.6.0"}},
+					RequestURI: "/foobarbaz-resource",
+				},
+				{
+					Header:     map[string][]string{"User-Agent": {"curl"}},
+					RequestURI: "/baz-resource",
+				},
+			},
+			results: []string{
+				"10.0.0.1:8082",
+				"10.0.0.1:8082",
+				"10.0.0.1:8082",
+				"10.0.0.1:8082",
+			},
+		},
+	}
+
 	for k, tc := range testcases {
-		backends := make([]*RemoteProxy, len(tc.Servers))
-		for i := range tc.Servers {
-			u, _ := url.Parse(tc.Servers[i])
-			backends[i] = &RemoteProxy{
-				remoteServer: u,
-				checker:      checker,
+		t.Run(k, func(t *testing.T) {
+			checker := fakeHealthChecker.NewFakeChecker(tc.servers)
+			servers := make([]*url.URL, 0, len(tc.servers))
+			for server := range tc.servers {
+				servers = append(servers, server)
 			}
-		}
+			sortURLs(servers)
+			klog.Infof("servers: %+v", servers)
 
-		rr := &rrLoadBalancerAlgo{
-			backends: backends,
-		}
+			lb := NewLoadBalancer(tc.lbMode, servers, nil, transportMgr, checker, nil, neverStop)
 
-		for i := range tc.PickBackends {
-			var b *RemoteProxy
-			for j := 0; j < tc.PickBackends[i].DeltaRequestsCnt; j++ {
-				b = rr.PickOne()
-			}
-
-			if len(tc.PickBackends[i].ReturnServer) == 0 {
-				if b != nil {
-					t.Errorf("%s rr lb pick: expect no backend server, but got %s", k, b.remoteServer.String())
+			for i, host := range tc.results {
+				strategy := lb.CurrentStrategy()
+				req := &http.Request{}
+				if tc.req != nil {
+					req = tc.req[i]
 				}
-			} else {
-				if b == nil {
-					t.Errorf("%s rr lb pick(round %d): expect backend server: %s, but got no backend server", k, i+1, tc.PickBackends[i].ReturnServer)
-				} else if b.remoteServer.String() != tc.PickBackends[i].ReturnServer {
-					t.Errorf("%s rr lb pick(round %d): expect backend server: %s, but got %s", k, i+1, tc.PickBackends[i].ReturnServer, b.remoteServer.String())
+				backend := strategy.PickOne(req)
+				if backend == nil {
+					if host != "" {
+						t.Errorf("expect %s, but got nil", host)
+					}
+				} else if backend.RemoteServer().Host != host {
+					t.Errorf("expect host %s for req %d, but got %s", host, i, backend.RemoteServer().Host)
 				}
 			}
-		}
+		})
 	}
 }
 
-func TestPriorityLoadBalancerAlgo(t *testing.T) {
-	testcases := map[string]struct {
-		Servers      []string
-		PickBackends []PickBackend
+func TestGetHash(t *testing.T) {
+	testCases := map[string]struct {
+		key      string
+		expected uint32
 	}{
-		"no backend servers": {
-			Servers: []string{},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: ""},
-			},
+		"empty key": {
+			key:      "",
+			expected: 2166136261,
 		},
-
-		"one backend server": {
-			Servers: []string{"http://127.0.0.1:8080"},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-			},
-		},
-
-		"multi backend server": {
-			Servers: []string{"http://127.0.0.1:8080", "http://127.0.0.1:8081", "http://127.0.0.1:8082"},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 2, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 3, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 4, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 4, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 4, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 5, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 5, ReturnServer: "http://127.0.0.1:8080"},
-			},
+		"normal key": {
+			key:      "10.0.0.1:8080",
+			expected: 1080829289,
 		},
 	}
 
-	checker := healthchecker.NewFakeChecker(true, map[string]int{})
-	for k, tc := range testcases {
-		backends := make([]*RemoteProxy, len(tc.Servers))
-		for i := range tc.Servers {
-			u, _ := url.Parse(tc.Servers[i])
-			backends[i] = &RemoteProxy{
-				remoteServer: u,
-				checker:      checker,
+	for k, tc := range testCases {
+		t.Run(k, func(t *testing.T) {
+			hash := getHash(tc.key)
+			if hash != tc.expected {
+				t.Errorf("expect hash %d, but got %d", tc.expected, hash)
 			}
-		}
-
-		rr := &priorityLoadBalancerAlgo{
-			backends: backends,
-		}
-
-		for i := range tc.PickBackends {
-			var b *RemoteProxy
-			for j := 0; j < tc.PickBackends[i].DeltaRequestsCnt; j++ {
-				b = rr.PickOne()
-			}
-
-			if len(tc.PickBackends[i].ReturnServer) == 0 {
-				if b != nil {
-					t.Errorf("%s priority lb pick: expect no backend server, but got %s", k, b.remoteServer.String())
-				}
-			} else {
-				if b == nil {
-					t.Errorf("%s priority lb pick: expect backend server: %s, but got no backend server", k, tc.PickBackends[i].ReturnServer)
-				} else if b.remoteServer.String() != tc.PickBackends[i].ReturnServer {
-					t.Errorf("%s priority lb pick(round %d): expect backend server: %s, but got %s", k, i+1, tc.PickBackends[i].ReturnServer, b.remoteServer.String())
-				}
-			}
-		}
-	}
-}
-
-func TestPriorityLoadBalancerAlgoWithReverseHealthy(t *testing.T) {
-	testcases := map[string]struct {
-		Servers      []string
-		PickBackends []PickBackend
-	}{
-		"multi backend server": {
-			Servers: []string{"http://127.0.0.1:8080", "http://127.0.0.1:8081", "http://127.0.0.1:8082"},
-			PickBackends: []PickBackend{
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8080"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8081"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8081"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8081"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 1, ReturnServer: "http://127.0.0.1:8082"},
-				{DeltaRequestsCnt: 2, ReturnServer: "http://127.0.0.1:8082"},
-			},
-		},
-	}
-
-	checker := healthchecker.NewFakeChecker(true, map[string]int{
-		"http://127.0.0.1:8080": 2,
-		"http://127.0.0.1:8081": 3})
-	for k, tc := range testcases {
-		backends := make([]*RemoteProxy, len(tc.Servers))
-		for i := range tc.Servers {
-			u, _ := url.Parse(tc.Servers[i])
-			backends[i] = &RemoteProxy{
-				remoteServer: u,
-				checker:      checker,
-			}
-		}
-
-		rr := &priorityLoadBalancerAlgo{
-			backends: backends,
-		}
-
-		for i := range tc.PickBackends {
-			var b *RemoteProxy
-			for j := 0; j < tc.PickBackends[i].DeltaRequestsCnt; j++ {
-				b = rr.PickOne()
-			}
-
-			if len(tc.PickBackends[i].ReturnServer) == 0 {
-				if b != nil {
-					t.Errorf("%s priority lb pick: expect no backend server, but got %s", k, b.remoteServer.String())
-				}
-			} else {
-				if b == nil {
-					t.Errorf("%s priority lb pick: expect backend server: %s, but got no backend server", k, tc.PickBackends[i].ReturnServer)
-				} else if b.remoteServer.String() != tc.PickBackends[i].ReturnServer {
-					t.Errorf("%s priority lb pick(round %d): expect backend server: %s, but got %s", k, i+1, tc.PickBackends[i].ReturnServer, b.remoteServer.String())
-				}
-			}
-		}
+		})
 	}
 }

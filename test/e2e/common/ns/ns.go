@@ -17,23 +17,25 @@ limitations under the License.
 package ns
 
 import (
-	"github.com/onsi/gomega"
+	"context"
+
 	apiv1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/test/e2e/framework"
+
+	"github.com/openyurtio/openyurt/test/e2e/util"
 )
 
 func DeleteNameSpace(c clientset.Interface, ns string) (err error) {
 	deletePolicy := metav1.DeletePropagationForeground
-	err = c.CoreV1().Namespaces().Delete(ns, &metav1.DeleteOptions{
+	err = c.CoreV1().Namespaces().Delete(context.Background(), ns, metav1.DeleteOptions{
 		PropagationPolicy: &deletePolicy,
 	})
-	if !apierrs.IsNotFound(err) {
-		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "fail to delete created namespaces:"+ns)
+	if err != nil && !apierrs.IsNotFound(err) {
+		return
 	}
-	err = framework.WaitForNamespacesDeleted(c, []string{ns}, framework.DefaultNamespaceDeletionTimeout)
+	err = util.WaitForNamespacesDeleted(c, []string{ns}, util.DefaultNamespaceDeletionTimeout)
 	return
 }
 
@@ -44,14 +46,14 @@ func CreateNameSpace(c clientset.Interface, ns string) (result *apiv1.Namespace,
 			Name: ns,
 		},
 	}
-	result, err = namespaceClient.Create(namespace)
+	result, err = namespaceClient.Create(context.Background(), namespace, metav1.CreateOptions{})
 	return
 }
 
 func ListNameSpaces(c clientset.Interface) (result *apiv1.NamespaceList, err error) {
-	return c.CoreV1().Namespaces().List(metav1.ListOptions{})
+	return c.CoreV1().Namespaces().List(context.Background(), metav1.ListOptions{})
 }
 
 func GetNameSpace(c clientset.Interface, ns string) (result *apiv1.Namespace, err error) {
-	return c.CoreV1().Namespaces().Get(ns, metav1.GetOptions{})
+	return c.CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{})
 }

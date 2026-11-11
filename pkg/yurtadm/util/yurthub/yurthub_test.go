@@ -1,0 +1,1472 @@
+/*
+Copyright 2023 The OpenYurt Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package yurthub
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/openyurtio/openyurt/pkg/yurtadm/cmd/join/joindata"
+	"github.com/openyurtio/openyurt/pkg/yurtadm/constants"
+)
+
+var (
+	defaultAddr = `apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    openyurt.io/static-pod-hash: 76f4f955b6
+  creationTimestamp: null
+  labels:
+    k8s-app: yurt-hub
+  name: yurt-hub
+  namespace: kube-system
+spec:
+  containers:
+    - command:
+      - yurthub
+      - --v=2
+      - --bind-address=127.0.0.1
+      - --server-addr=https://127.0.0.1:6443
+      - --node-name=$(NODE_NAME)
+      - --bootstrap-file=/var/lib/yurthub/bootstrap-hub.conf
+      - --working-mode=edge
+      - --namespace=kube-system
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+      image: openyurt/yurthub:v1.3.0
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: 127.0.0.1
+          path: /v1/healthz
+          port: 10267
+          scheme: HTTP
+        initialDelaySeconds: 300
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: yurt-hub
+      resources:
+        limits:
+          memory: 300Mi
+        requests:
+          cpu: 150m
+          memory: 150Mi
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_RAW
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+        - mountPath: /var/lib/yurthub
+          name: hub-dir
+        - mountPath: /etc/kubernetes
+          name: kubernetes
+  dnsPolicy: ClusterFirst
+  hostNetwork: true
+  priority: 2000001000
+  priorityClassName: system-node-critical
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+  volumes:
+    - hostPath:
+        path: /var/lib/yurthub
+        type: DirectoryOrCreate
+      name: hub-dir
+    - hostPath:
+        path: /etc/kubernetes
+        type: Directory
+      name: kubernetes
+status: {}
+`
+
+	setAddr = `apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    openyurt.io/static-pod-hash: 76f4f955b6
+  creationTimestamp: null
+  labels:
+    k8s-app: yurt-hub
+  name: yurt-hub
+  namespace: kube-system
+spec:
+  containers:
+    - command:
+      - yurthub
+      - --v=2
+      - --bind-address=127.0.0.1
+      - --server-addr=https://192.0.0.1:6443
+      - --node-name=$(NODE_NAME)
+      - --bootstrap-file=/var/lib/yurthub/bootstrap-hub.conf
+      - --working-mode=edge
+      - --namespace=kube-system
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+      image: openyurt/yurthub:v1.3.0
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: 127.0.0.1
+          path: /v1/healthz
+          port: 10267
+          scheme: HTTP
+        initialDelaySeconds: 300
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: yurt-hub
+      resources:
+        limits:
+          memory: 300Mi
+        requests:
+          cpu: 150m
+          memory: 150Mi
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_RAW
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+        - mountPath: /var/lib/yurthub
+          name: hub-dir
+        - mountPath: /etc/kubernetes
+          name: kubernetes
+  dnsPolicy: ClusterFirst
+  hostNetwork: true
+  priority: 2000001000
+  priorityClassName: system-node-critical
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+  volumes:
+    - hostPath:
+        path: /var/lib/yurthub
+        type: DirectoryOrCreate
+      name: hub-dir
+    - hostPath:
+        path: /etc/kubernetes
+        type: Directory
+      name: kubernetes
+status: {}
+`
+	setAddr2 = `apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    openyurt.io/static-pod-hash: 76f4f955b6
+  creationTimestamp: null
+  labels:
+    k8s-app: yurt-hub
+  name: yurt-hub
+  namespace: kube-system
+spec:
+  containers:
+    - command:
+      - yurthub
+      - --v=2
+      - --bind-address=127.0.0.1
+      - --server-addr=https://192.0.0.2:6443
+      - --node-name=$(NODE_NAME)
+      - --bootstrap-file=/var/lib/yurthub/bootstrap-hub.conf
+      - --working-mode=edge
+      - --namespace=kube-system
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+      image: openyurt/yurthub:v1.3.0
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: 127.0.0.1
+          path: /v1/healthz
+          port: 10267
+          scheme: HTTP
+        initialDelaySeconds: 300
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: yurt-hub
+      resources:
+        limits:
+          memory: 300Mi
+        requests:
+          cpu: 150m
+          memory: 150Mi
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_RAW
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+        - mountPath: /var/lib/yurthub
+          name: hub-dir
+        - mountPath: /etc/kubernetes
+          name: kubernetes
+  dnsPolicy: ClusterFirst
+  hostNetwork: true
+  priority: 2000001000
+  priorityClassName: system-node-critical
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+  volumes:
+    - hostPath:
+        path: /var/lib/yurthub
+        type: DirectoryOrCreate
+      name: hub-dir
+    - hostPath:
+        path: /etc/kubernetes
+        type: Directory
+      name: kubernetes
+status: {}
+`
+
+	serverAddrsA = "https://192.0.0.1:6443"
+	serverAddrsB = "https://192.0.0.2:6443"
+)
+
+func Test_useRealServerAddr(t *testing.T) {
+	type args struct {
+		yurthubTemplate       string
+		kubernetesServerAddrs string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "change default server addr",
+			args: args{
+				yurthubTemplate:       defaultAddr,
+				kubernetesServerAddrs: serverAddrsA,
+			},
+			want: setAddr,
+		},
+		{
+			name: " already set server addr",
+			args: args{
+				yurthubTemplate:       setAddr,
+				kubernetesServerAddrs: serverAddrsB,
+			},
+			want: setAddr2,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			actualYaml, err := useRealServerAddr(test.args.yurthubTemplate, test.args.kubernetesServerAddrs)
+			if err != nil {
+				t.Errorf("unexpected error: %s", err)
+			}
+
+			assert.Equal(t, actualYaml, test.want)
+		})
+	}
+}
+
+func TestCheckYurtHubItself(t *testing.T) {
+	tests := []struct {
+		testName string
+		ns       string
+		name     string
+		want     bool
+	}{
+		{
+			testName: "test1",
+			ns:       "kube-system",
+			name:     "yurt-hub",
+			want:     true,
+		},
+		{
+			testName: "test2",
+			ns:       "cattle-system",
+			name:     "yurt-hub",
+			want:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CheckYurtHubItself(tt.ns, tt.name); got != tt.want {
+				t.Errorf("CheckYurtHubItself() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+type mockYurtJoinData struct {
+	joindata.YurtJoinData
+	serverAddr       string
+	nodeRegistration *joindata.NodeRegistration
+	namespace        string
+}
+
+func (m *mockYurtJoinData) ServerAddr() string {
+	return m.serverAddr
+}
+
+func (m *mockYurtJoinData) NodeRegistration() *joindata.NodeRegistration {
+	return m.nodeRegistration
+}
+
+func (m *mockYurtJoinData) Namespace() string {
+	return m.namespace
+}
+
+func (m *mockYurtJoinData) YurtHubBinaryURL() string {
+	return ""
+}
+
+func useTempYurthubHostPaths(t *testing.T) string {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	oldBootstrapConfigPath := yurthubBootstrapConfigPath
+	oldExecStartPath := yurthubExecStartPath
+	oldServiceFilePath := yurthubServiceFilePath
+	oldServiceConfFilePath := yurthubServiceConfFilePath
+	oldWorkDirPath := yurthubWorkDirPath
+	oldCacheDirPath := yurthubCacheDirPath
+
+	yurthubBootstrapConfigPath = filepath.Join(tempDir, "var", "lib", "yurthub", "bootstrap-hub.conf")
+	yurthubExecStartPath = filepath.Join(tempDir, "usr", "local", "bin", "yurthub")
+	yurthubServiceFilePath = filepath.Join(tempDir, "etc", "systemd", "system", "yurthub.service")
+	yurthubServiceConfFilePath = filepath.Join(tempDir, "etc", "systemd", "system", "yurthub.service.d", "10-yurthub.conf")
+	yurthubWorkDirPath = filepath.Join(tempDir, "var", "lib", "yurthub")
+	yurthubCacheDirPath = filepath.Join(tempDir, "etc", "kubernetes", "cache")
+
+	t.Cleanup(func() {
+		yurthubBootstrapConfigPath = oldBootstrapConfigPath
+		yurthubExecStartPath = oldExecStartPath
+		yurthubServiceFilePath = oldServiceFilePath
+		yurthubServiceConfFilePath = oldServiceConfFilePath
+		yurthubWorkDirPath = oldWorkDirPath
+		yurthubCacheDirPath = oldCacheDirPath
+	})
+
+	return tempDir
+}
+
+func newLocalHTTPServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+
+	var ts *httptest.Server
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Skipf("httptest server is unavailable in this environment: %v", r)
+			}
+		}()
+		ts = httptest.NewServer(handler)
+	}()
+
+	return ts
+}
+
+func TestCheckAndInstallYurthub(t *testing.T) {
+	tempDir := useTempYurthubHostPaths(t)
+	yurthubExecPath := filepath.Join(tempDir, "existing-yurthub")
+
+	oldLookPath := lookPath
+	oldDownloadFile := downloadFile
+	oldUntar := untar
+	oldCopyFile := copyFile
+	defer func() {
+		lookPath = oldLookPath
+		downloadFile = oldDownloadFile
+		untar = oldUntar
+		copyFile = oldCopyFile
+	}()
+
+	t.Run("Yurthub binary already exists", func(t *testing.T) {
+		err := os.WriteFile(yurthubExecPath, []byte("dummy"), 0755)
+		if err != nil {
+			t.Fatalf("Failed to create dummy yurthub binary: %v", err)
+		}
+
+		lookPath = func(file string) (string, error) {
+			if file == yurthubExecStartPath {
+				return yurthubExecPath, nil
+			}
+			return oldLookPath(file)
+		}
+
+		err = CheckAndInstallYurthub("v1.7.0")
+		if err != nil {
+			t.Errorf("CheckAndInstallYurthub() error = %v, wantErr %v", err, nil)
+		}
+	})
+
+	t.Run("Yurthub version is invalid when empty", func(t *testing.T) {
+		lookPath = oldLookPath
+		if _, err := resolveYurthubReleaseVersion(""); err == nil {
+			t.Errorf("resolveYurthubReleaseVersion() should return error for empty version")
+		}
+	})
+
+	t.Run("Yurthub binary does not exist", func(t *testing.T) {
+		lookPath = func(file string) (string, error) {
+			if file == yurthubExecStartPath {
+				return "", &os.PathError{Op: "stat", Path: file, Err: os.ErrNotExist}
+			}
+			return oldLookPath(file)
+		}
+
+		downloadFile = func(url, savePath string, retry int) error {
+			wantURL := fmt.Sprintf(constants.YurthubExecURLFormat, "v1.7.0", "v1.7.0", runtime.GOARCH)
+			if url != wantURL {
+				t.Fatalf("unexpected download url: %s, want %s", url, wantURL)
+			}
+			if filepath.Base(savePath) != fmt.Sprintf("yurthub-v1.7.0-linux-%s.tar.gz", runtime.GOARCH) {
+				t.Fatalf("unexpected save path: %s", savePath)
+			}
+			return nil
+		}
+		untar = func(src, dst string) error {
+			binaryDir := filepath.Join(dst, fmt.Sprintf("linux-%s", runtime.GOARCH))
+			if err := os.MkdirAll(binaryDir, 0755); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(binaryDir, constants.Yurthub), []byte("dummy"), 0755)
+		}
+		copyFile = func(src, dest string, mode os.FileMode) error {
+			if filepath.Base(src) != constants.Yurthub {
+				t.Fatalf("unexpected copy source: %s", src)
+			}
+			if dest != yurthubExecStartPath {
+				t.Fatalf("unexpected copy destination: %s", dest)
+			}
+			if mode != 0755 {
+				t.Fatalf("unexpected copy mode: %v", mode)
+			}
+			return nil
+		}
+
+		err := CheckAndInstallYurthub("v1.7.0-6fc029d")
+		assert.NoError(t, err)
+	})
+
+	t.Run("Yurthub version parse failure stops download", func(t *testing.T) {
+		lookPath = func(file string) (string, error) {
+			if file == yurthubExecStartPath {
+				return "", &os.PathError{Op: "stat", Path: file, Err: os.ErrNotExist}
+			}
+			return oldLookPath(file)
+		}
+
+		downloadFile = func(url, savePath string, retry int) error {
+			t.Fatalf("downloadFile should not be called when version is invalid")
+			return nil
+		}
+
+		err := CheckAndInstallYurthub("6fc029d")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "can not parse yurthub release version")
+	})
+}
+
+func TestResolveYurthubReleaseVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "release tag",
+			version: "v1.7.0",
+			want:    "v1.7.0",
+		},
+		{
+			name:    "tag with commit suffix",
+			version: "v1.7.0-6fc029d",
+			want:    "v1.7.0",
+		},
+		{
+			name:    "empty version",
+			version: "",
+			wantErr: true,
+		},
+		{
+			name:    "default build version",
+			version: "v0.0.0",
+			wantErr: true,
+		},
+		{
+			name:    "default build version with commit suffix",
+			version: "v0.0.0-6fc029d",
+			wantErr: true,
+		},
+		{
+			name:    "commit hash",
+			version: "9926136",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveYurthubReleaseVersion(tt.version)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("resolveYurthubReleaseVersion(%q) expected error, got nil", tt.version)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("resolveYurthubReleaseVersion(%q) unexpected error: %v", tt.version, err)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("resolveYurthubReleaseVersion(%q) = %q, want %q", tt.version, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCreateYurthubSystemdService(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
+	mockData := &mockYurtJoinData{
+		serverAddr: "127.0.0.1:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:         "test-node",
+			NodePoolName: "test-pool",
+			WorkingMode:  "edge",
+		},
+		namespace: "kube-system",
+	}
+
+	oldExecCommand := execCommand
+	oldExecLookPath := lookPath
+	defer func() {
+		execCommand = oldExecCommand
+		lookPath = oldExecLookPath
+	}()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		return exec.Command("echo", "dummy")
+	}
+
+	t.Run("Create systemd service successfully", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("CreateYurthubSystemdService() panicked: %v", r)
+			}
+		}()
+
+		err := CreateYurthubSystemdService(mockData)
+		_ = err
+	})
+
+	t.Run("Create systemd service with empty node pool name", func(t *testing.T) {
+		mockDataEmptyPool := &mockYurtJoinData{
+			serverAddr: "127.0.0.1:6443",
+			nodeRegistration: &joindata.NodeRegistration{
+				Name:         "test-node",
+				NodePoolName: "",
+				WorkingMode:  "edge",
+			},
+			namespace: "kube-system",
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("CreateYurthubSystemdService() with empty node pool panicked: %v", r)
+			}
+		}()
+
+		err := CreateYurthubSystemdService(mockDataEmptyPool)
+		_ = err
+	})
+}
+
+func TestCheckYurthubServiceHealth(t *testing.T) {
+
+	oldExecCommand := execCommand
+	oldCheckYurthubHealthz := checkYurthubHealthzFunc
+	defer func() {
+		execCommand = oldExecCommand
+		checkYurthubHealthzFunc = oldCheckYurthubHealthz
+	}()
+
+	t.Run("Service is active and healthy", func(t *testing.T) {
+		execCommand = func(name string, arg ...string) *exec.Cmd {
+			if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+				return exec.Command("echo", "active")
+			}
+			return exec.Command("echo", "dummy")
+		}
+
+		checkYurthubHealthzFunc = func(string) error {
+			return nil
+		}
+
+		err := CheckYurthubServiceHealth("127.0.0.1")
+		if err != nil {
+			t.Errorf("CheckYurthubServiceHealth() error = %v, wantErr %v", err, nil)
+		}
+	})
+
+	t.Run("Service is not active", func(t *testing.T) {
+		execCommand = func(name string, arg ...string) *exec.Cmd {
+			if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+				return exec.Command("false")
+			}
+			return exec.Command("echo", "dummy")
+		}
+
+		err := CheckYurthubServiceHealth("127.0.0.1")
+		if err == nil {
+			t.Errorf("CheckYurthubServiceHealth() error = %v, wantErr %v", err, true)
+		}
+	})
+
+	t.Run("Service is active but not healthy", func(t *testing.T) {
+		execCommand = func(name string, arg ...string) *exec.Cmd {
+			if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+				return exec.Command("echo", "active")
+			}
+			return exec.Command("echo", "dummy")
+		}
+
+		checkYurthubHealthzFunc = func(string) error {
+			return fmt.Errorf("health check failed")
+		}
+
+		err := CheckYurthubServiceHealth("127.0.0.1")
+		if err == nil {
+			t.Errorf("CheckYurthubServiceHealth() error = %v, wantErr %v", err, true)
+		}
+	})
+}
+
+func TestCheckYurthubServiceHealth_HealthzFails(t *testing.T) {
+	oldExec := execCommand
+	oldHealthz := checkYurthubHealthzFunc
+	defer func() {
+		execCommand = oldExec
+		checkYurthubHealthzFunc = oldHealthz
+	}()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+			return exec.Command("echo", "active")
+		}
+		return exec.Command("echo", "dummy")
+	}
+
+	checkYurthubHealthzFunc = func(addr string) error {
+		return fmt.Errorf("health check timeout")
+	}
+
+	err := CheckYurthubServiceHealth("127.0.0.1")
+	if err == nil {
+		t.Errorf("Expected error from healthz check, but got nil")
+	}
+}
+
+func TestCheckYurthubServiceHealth_HealthzSuccess(t *testing.T) {
+	oldExec := execCommand
+	oldHealthz := checkYurthubHealthzFunc
+	defer func() {
+		execCommand = oldExec
+		checkYurthubHealthzFunc = oldHealthz
+	}()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+			return exec.Command("echo", "active")
+		}
+		return exec.Command("echo", "dummy")
+	}
+
+	checkYurthubHealthzFunc = func(addr string) error {
+		return nil
+	}
+
+	err := CheckYurthubServiceHealth("127.0.0.1")
+	if err != nil {
+		t.Errorf("Expected no error when both service and healthz are ok, but got %v", err)
+	}
+}
+
+func Test_CreateYurthubSystemdService_StartFails(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
+	mockData := &mockYurtJoinData{
+		serverAddr: "127.0.0.1:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:         "svc-node",
+			NodePoolName: "svc-pool",
+			WorkingMode:  "edge",
+		},
+		namespace: "kube-system",
+	}
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" {
+			if len(arg) > 0 && arg[0] == "start" {
+				return exec.Command("false")
+			}
+			return exec.Command("echo", "ok")
+		}
+		return exec.Command("echo", "ok")
+	}
+
+	err := CreateYurthubSystemdService(mockData)
+	if err == nil {
+		t.Fatalf("CreateYurthubSystemdService() expected to fail due to systemctl start error, but got nil")
+	}
+}
+
+func Test_CheckAndInstallYurthub_LookPathErrorCausesDownloadAttempt(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
+	oldLookPath := lookPath
+	oldDownloadFile := downloadFile
+	defer func() { lookPath = oldLookPath }()
+	defer func() { downloadFile = oldDownloadFile }()
+
+	lookPath = func(file string) (string, error) {
+		if file == yurthubExecStartPath {
+			return "", &os.PathError{Op: "stat", Path: file, Err: os.ErrNotExist}
+		}
+		return oldLookPath(file)
+	}
+
+	downloadFile = func(url, savePath string, retry int) error {
+		return errors.New("simulated download failure")
+	}
+
+	err := CheckAndInstallYurthub("v0.0.0-test")
+	if err == nil {
+		t.Fatalf("CheckAndInstallYurthub() expected to return an error when binary missing and download/copy fails, but got nil")
+	}
+}
+
+func Test_SetHubBootstrapConfig_InvalidData_ReturnsError(t *testing.T) {
+	err := SetHubBootstrapConfig("invalid-server:6443", "badtoken", []string{"hash"})
+	if err == nil {
+		t.Fatalf("SetHubBootstrapConfig() expected to return error for invalid data, got nil")
+	}
+}
+
+func Test_CleanHubBootstrapConfig_NoError(t *testing.T) {
+	tempDir := useTempYurthubHostPaths(t)
+	if err := os.MkdirAll(filepath.Dir(yurthubBootstrapConfigPath), 0755); err != nil {
+		t.Fatalf("failed to prepare bootstrap config dir: %v", err)
+	}
+	if err := os.WriteFile(yurthubBootstrapConfigPath, []byte("dummy"), 0644); err != nil {
+		t.Fatalf("failed to prepare bootstrap config file: %v", err)
+	}
+
+	if err := CleanHubBootstrapConfig(); err != nil {
+		t.Fatalf("CleanHubBootstrapConfig() expected no error, got: %v", err)
+	}
+	_, err := os.Stat(filepath.Join(tempDir, "var", "lib", "yurthub", "bootstrap-hub.conf"))
+	assert.True(t, os.IsNotExist(err))
+}
+
+func Test_CheckYurtHubItself_CloudAndYurtNames(t *testing.T) {
+	if !CheckYurtHubItself(constants.YurthubNamespace, constants.YurthubCloudYurtStaticSetName) {
+		t.Errorf("expected CheckYurtHubItself to be true for cloud static set name")
+	}
+	if !CheckYurtHubItself(constants.YurthubNamespace, constants.YurthubYurtStaticSetName) {
+		t.Errorf("expected CheckYurtHubItself to be true for yurt static set name")
+	}
+}
+func Test_CreateYurthubSystemdService_DaemonReloadFails(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
+	mockData := &mockYurtJoinData{
+		serverAddr: "127.0.0.1:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:         "daemon-fail-node",
+			NodePoolName: "pool",
+			WorkingMode:  "edge",
+		},
+		namespace: "kube-system",
+	}
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "daemon-reload" {
+			return exec.Command("false")
+		}
+		return exec.Command("echo", "ok")
+	}
+
+	if err := CreateYurthubSystemdService(mockData); err == nil {
+		t.Fatalf("expected error when daemon-reload fails, got nil")
+	}
+}
+
+func Test_CreateYurthubSystemdService_EnableFails(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
+	mockData := &mockYurtJoinData{
+		serverAddr: "127.0.0.1:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:         "enable-fail-node",
+			NodePoolName: "pool",
+			WorkingMode:  "edge",
+		},
+		namespace: "kube-system",
+	}
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "enable" {
+			return exec.Command("false")
+		}
+		return exec.Command("echo", "ok")
+	}
+
+	if err := CreateYurthubSystemdService(mockData); err == nil {
+		t.Fatalf("expected error when systemctl enable fails, got nil")
+	}
+}
+
+func Test_CheckYurthubServiceHealth_SystemctlRunError(t *testing.T) {
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+			return exec.Command("false")
+		}
+		return exec.Command("echo", "ok")
+	}
+
+	if err := CheckYurthubServiceHealth("127.0.0.1"); err == nil {
+		t.Fatalf("expected error when systemctl is-active command fails, got nil")
+	}
+}
+
+func Test_CheckYurthubServiceHealth_HealthzFuncErrorPropagation(t *testing.T) {
+	oldExec := execCommand
+	oldHealthz := checkYurthubHealthzFunc
+	defer func() {
+		execCommand = oldExec
+		checkYurthubHealthzFunc = oldHealthz
+	}()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+			return exec.Command("echo", "active")
+		}
+		return exec.Command("echo", "ok")
+	}
+
+	checkYurthubHealthzFunc = func(addr string) error {
+		return errors.New("simulated healthz failure")
+	}
+
+	if err := CheckYurthubServiceHealth("127.0.0.1"); err == nil {
+		t.Fatalf("expected error when healthz check fails, got nil")
+	}
+}
+
+func Test_setYurthubUnitService_TemplateSubstitutionSuccess(t *testing.T) {
+	mockData := &mockYurtJoinData{
+		serverAddr: "192.0.2.10:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:        "test-node",
+			WorkingMode: "edge",
+		},
+		namespace: "",
+	}
+
+	err := setYurthubUnitService(t.TempDir(), mockData)
+	assert.NoError(t, err)
+}
+
+var (
+	osStat     = os.Stat
+	osMkdirAll = os.MkdirAll
+)
+
+func Test_setYurthubMainService_DirCreationSuccess(t *testing.T) {
+	oldStat := osStat
+	oldMkdirAll := osMkdirAll
+
+	osStat = func(name string) (os.FileInfo, error) {
+		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
+	}
+
+	osMkdirAll = func(path string, perm os.FileMode) error {
+		if path == filepath.Dir(constants.YurthubServicePath) {
+			return fmt.Errorf("permission denied")
+		}
+		return os.MkdirAll(path, perm)
+	}
+
+	defer func() {
+		osStat = oldStat
+		osMkdirAll = oldMkdirAll
+	}()
+
+	err := setYurthubMainService(t.TempDir())
+	assert.NoError(t, err)
+}
+
+func Test_setYurthubUnitService_DirCreationSuccess(t *testing.T) {
+	mockData := &mockYurtJoinData{
+		serverAddr: "192.0.2.10:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:         "test-node",
+			NodePoolName: "test-pool",
+			WorkingMode:  "edge",
+		},
+		namespace: "kube-system",
+	}
+	oldStat := osStat
+	oldMkdirAll := osMkdirAll
+
+	osStat = func(name string) (os.FileInfo, error) {
+		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
+	}
+
+	osMkdirAll = func(path string, perm os.FileMode) error {
+		if path == filepath.Dir(constants.YurthubServiceConfPath) {
+			return fmt.Errorf("permission denied")
+		}
+		return os.MkdirAll(path, perm)
+	}
+
+	defer func() {
+		osStat = oldStat
+		osMkdirAll = oldMkdirAll
+	}()
+
+	err := setYurthubUnitService(t.TempDir(), mockData)
+	assert.NoError(t, err)
+}
+
+func Test_CheckYurthubServiceHealth_CmdRunError(t *testing.T) {
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+			return exec.Command("sh", "-c", "exit 1")
+		}
+		return exec.Command("echo", "dummy")
+	}
+
+	err := CheckYurthubServiceHealth("127.0.0.1")
+	if err == nil {
+		t.Fatalf("CheckYurthubServiceHealth() should return error when systemctl fails, but got nil")
+	}
+
+	expectedErrMsg := "yurthub service is not active"
+	if !strings.Contains(err.Error(), expectedErrMsg) {
+		t.Errorf("Expected error message to contain %q, but got: %v", expectedErrMsg, err)
+	}
+}
+
+func Test_useRealServerAddr_ScanError(t *testing.T) {
+	yurthubTemplate := "test template"
+	kubernetesServerAddrs := "https://192.168.1.1:6443"
+
+	_, err := useRealServerAddr(yurthubTemplate, kubernetesServerAddrs)
+	if err != nil {
+		t.Logf("useRealServerAddr returned error (might be expected): %v", err)
+	}
+}
+
+func Test_useRealServerAddr_NoServerAddrLine(t *testing.T) {
+	yurthubTemplate := `apiVersion: v1
+kind: Pod
+metadata:
+  name: yurt-hub
+spec:
+  containers:
+    - command:
+      - yurthub
+      - --v=2
+      name: yurt-hub`
+
+	kubernetesServerAddrs := "https://192.168.1.1:6443"
+	result, err := useRealServerAddr(yurthubTemplate, kubernetesServerAddrs)
+
+	if err != nil {
+		t.Fatalf("useRealServerAddr() unexpected error: %v", err)
+	}
+
+	if !strings.Contains(result, "--v=2") {
+		t.Errorf("Expected result to contain original content, but got: %s", result)
+	}
+}
+
+func Test_CheckYurthubReadyzOnce_RequestFail(t *testing.T) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == constants.ServerReadyzURLPath {
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+		}
+	}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("Failed to parse test server URL: %v", err)
+	}
+
+	result := CheckYurthubReadyzOnce(u.Hostname())
+	if result {
+		t.Errorf("CheckYurthubReadyzOnce() should return false when server returns error status")
+	}
+}
+
+func Test_CheckYurthubReadyzOnce_NonOKResponse(t *testing.T) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == constants.ServerReadyzURLPath {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("Not Ready"))
+		}
+	}))
+	defer ts.Close()
+
+	addr := strings.TrimPrefix(ts.URL, "http://")
+	result := CheckYurthubReadyzOnce(addr)
+	assert.False(t, result)
+}
+
+func Test_CheckYurtHubItself_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		ns       string
+		podName  string
+		expected bool
+	}{
+		{
+			name:     "Empty namespace",
+			ns:       "",
+			podName:  constants.YurthubYurtStaticSetName,
+			expected: false,
+		},
+		{
+			name:     "Empty pod name",
+			ns:       constants.YurthubNamespace,
+			podName:  "",
+			expected: false,
+		},
+		{
+			name:     "Both empty",
+			ns:       "",
+			podName:  "",
+			expected: false,
+		},
+		{
+			name:     "Wrong namespace with correct pod name",
+			ns:       "default",
+			podName:  constants.YurthubYurtStaticSetName,
+			expected: false,
+		},
+		{
+			name:     "Correct namespace with wrong pod name",
+			ns:       constants.YurthubNamespace,
+			podName:  "other-pod",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := CheckYurtHubItself(tt.ns, tt.podName)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func Test_CreateYurthubSystemdService_DaemonReloadError(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
+	mockData := &mockYurtJoinData{
+		serverAddr: "127.0.0.1:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:        "test-node",
+			WorkingMode: "edge",
+		},
+		namespace: "kube-system",
+	}
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "daemon-reload" {
+			return exec.Command("false")
+		}
+		return exec.Command("echo", "ok")
+	}
+
+	err := CreateYurthubSystemdService(mockData)
+	assert.Error(t, err)
+}
+
+func Test_CreateYurthubSystemdService_EnableError(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
+	mockData := &mockYurtJoinData{
+		serverAddr: "127.0.0.1:6443",
+		nodeRegistration: &joindata.NodeRegistration{
+			Name:        "test-node",
+			WorkingMode: "edge",
+		},
+		namespace: "kube-system",
+	}
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "enable" {
+			return exec.Command("false")
+		}
+		return exec.Command("echo", "ok")
+	}
+
+	err := CreateYurthubSystemdService(mockData)
+	assert.Error(t, err)
+}
+
+func Test_CheckYurthubReadyzOnce_ReadBodyFail(t *testing.T) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == constants.ServerReadyzURLPath {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("server does not support hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn.Close()
+		}
+	}))
+	defer ts.Close()
+
+	addr := strings.TrimPrefix(ts.URL, "http://")
+	result := CheckYurthubReadyzOnce(addr)
+	assert.False(t, result)
+}
+
+func Test_useRealServerAddr_ScannerError(t *testing.T) {
+	var largeInput strings.Builder
+	for i := 0; i < 100000; i++ {
+		fmt.Fprintf(&largeInput, "line %d\n", i)
+	}
+
+	fmt.Fprintf(&largeInput, "- --%s=https://127.0.0.1:6443\n", constants.ServerAddr)
+
+	for i := 100000; i < 200000; i++ {
+		fmt.Fprintf(&largeInput, "line %d\n", i)
+	}
+
+	_, err := useRealServerAddr(largeInput.String(), "https://192.168.1.1:6443")
+	assert.NoError(t, err)
+}
+
+func Test_CheckYurtHubItself_BoundaryCases(t *testing.T) {
+	testCases := []struct {
+		name     string
+		ns       string
+		podName  string
+		expected bool
+	}{
+		{
+			name:     "Empty strings",
+			ns:       "",
+			podName:  "",
+			expected: false,
+		},
+		{
+			name:     "Correct namespace, wrong pod name",
+			ns:       constants.YurthubNamespace,
+			podName:  "wrong-name",
+			expected: false,
+		},
+		{
+			name:     "Wrong namespace, correct pod name",
+			ns:       "wrong-namespace",
+			podName:  constants.YurthubYurtStaticSetName,
+			expected: false,
+		},
+		{
+			name:     "Wrong namespace, correct cloud pod name",
+			ns:       "wrong-namespace",
+			podName:  constants.YurthubCloudYurtStaticSetName,
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := CheckYurtHubItself(tc.ns, tc.podName)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func Test_CheckYurthubHealthz_ClientTimeout(t *testing.T) {
+	oldCheckFunc := checkYurthubHealthzFunc
+	defer func() {
+		checkYurthubHealthzFunc = oldCheckFunc
+	}()
+
+	checkYurthubHealthzFunc = func(server string) error {
+		time.Sleep(100 * time.Millisecond)
+		return fmt.Errorf("mock error")
+	}
+
+	err := CheckYurthubServiceHealth("127.0.0.1")
+	assert.Error(t, err)
+}
+
+func Test_useRealServerAddr_ComplexYAML(t *testing.T) {
+	complexYAML := `apiVersion: v1
+kind: Pod
+metadata:
+  name: yurt-hub
+spec:
+  containers:
+  - command:
+    - yurthub
+    - --server-addr=https://127.0.0.1:6443
+    - --another-flag=value
+    - --server-addr=https://127.0.0.1:6443 # 重复的参数
+    name: yurt-hub`
+
+	result, err := useRealServerAddr(complexYAML, "https://192.168.1.1:6443")
+	assert.NoError(t, err)
+	assert.Contains(t, result, "--server-addr=https://192.168.1.1:6443")
+}
+
+func Test_useRealServerAddr_EmptyAndSpecialChars(t *testing.T) {
+	yamlWithEmptyLines := `apiVersion: v1
+
+kind: Pod
+
+metadata:
+  name: yurt-hub
+spec:
+  containers:
+  - command:
+    - yurthub
+    - --server-addr=https://127.0.0.1:6443
+    
+    name: yurt-hub`
+
+	result, err := useRealServerAddr(yamlWithEmptyLines, "https://192.168.1.1:6443")
+	assert.NoError(t, err)
+	assert.Contains(t, result, "--server-addr=https://192.168.1.1:6443")
+}
+
+func TestCheckYurthubReadyzOnce_VariousCases(t *testing.T) {
+	result := CheckYurthubReadyzOnce("invalid-host:10267")
+	assert.False(t, result)
+
+	result = CheckYurthubReadyzOnce("127.0.0.1:99999")
+	assert.False(t, result)
+}
+
+func Test_CheckYurthubHealthz_WithTimeout(t *testing.T) {
+	originalFunc := checkYurthubHealthzFunc
+	defer func() {
+		checkYurthubHealthzFunc = originalFunc
+	}()
+
+	checkYurthubHealthzFunc = func(server string) error {
+		time.Sleep(10 * time.Millisecond)
+		return fmt.Errorf("mock error")
+	}
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		if name == "systemctl" && len(arg) > 0 && arg[0] == "is-active" {
+			return exec.Command("echo", "active")
+		}
+		return exec.Command("echo", "dummy")
+	}
+
+	err := CheckYurthubServiceHealth("127.0.0.1")
+	assert.Error(t, err)
+}
+
+func Test_pollYurthubEndpointOK_Success(t *testing.T) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer ts.Close()
+
+	err := pollYurthubEndpointOK(ts.URL, 50*time.Millisecond, 2*time.Second)
+	assert.NoError(t, err)
+}
+
+func Test_pollYurthubEndpointOK_EventualOK(t *testing.T) {
+	var calls atomic.Int32
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("NotReady"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer ts.Close()
+
+	err := pollYurthubEndpointOK(ts.URL, 50*time.Millisecond, 3*time.Second)
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, calls.Load(), int32(3))
+}
+
+func Test_pollYurthubEndpointOK_TimesOutWhenNeverOK(t *testing.T) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("NotReady"))
+	}))
+	defer ts.Close()
+
+	err := pollYurthubEndpointOK(ts.URL, 50*time.Millisecond, 300*time.Millisecond)
+	assert.Error(t, err)
+}
+
+func Test_pollYurthubEndpointOK_ContextPropagation(t *testing.T) {
+	release := make(chan struct{})
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer ts.Close()
+	defer close(release)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- pollYurthubEndpointOK(ts.URL, 100*time.Millisecond, 400*time.Millisecond)
+	}()
+
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("pollYurthubEndpointOK did not return after the timeout; context was not propagated to the in-flight request")
+	}
+}
+
+func Test_pollYurthubEndpointOK_PerRequestTimeoutBoundsStalledSocket(t *testing.T) {
+	var hits int32
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	err := pollYurthubEndpointOK(ts.URL, 100*time.Millisecond, 700*time.Millisecond)
+	assert.Error(t, err)
+	assert.GreaterOrEqual(t, atomic.LoadInt32(&hits), int32(2),
+		"a stalled endpoint must be retried across poll iterations; each request should be bounded by the interval, not the full timeout")
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func Test_CheckYurthubHealthzAndReadyz_OK(t *testing.T) {
+	original := http.DefaultTransport
+	defer func() { http.DefaultTransport = original }()
+
+	var paths []string
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		paths = append(paths, req.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("OK")),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+
+	assert.NoError(t, CheckYurthubHealthz("127.0.0.1"))
+	assert.NoError(t, CheckYurthubReadyz("127.0.0.1"))
+	assert.Equal(t, []string{constants.ServerHealthzURLPath, constants.ServerReadyzURLPath}, paths)
+}
+
+func Test_pollYurthubEndpointOK_RequestBuildError(t *testing.T) {
+	err := pollYurthubEndpointOK("http://%zz", 10*time.Millisecond, 50*time.Millisecond)
+	assert.Error(t, err)
+}

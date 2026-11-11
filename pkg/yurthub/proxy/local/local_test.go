@@ -21,22 +21,29 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/openyurtio/openyurt/pkg/yurthub/cachemanager"
-	"github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/serializer"
-	proxyutil "github.com/openyurtio/openyurt/pkg/yurthub/proxy/util"
-	"github.com/openyurtio/openyurt/pkg/yurthub/storage/disk"
-
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/openyurtio/openyurt/pkg/yurthub/cachemanager"
+	"github.com/openyurtio/openyurt/pkg/yurthub/configuration"
+	hubmeta "github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/meta"
+	"github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/serializer"
+	proxyutil "github.com/openyurtio/openyurt/pkg/yurthub/proxy/util"
+	"github.com/openyurtio/openyurt/pkg/yurthub/storage"
+	"github.com/openyurtio/openyurt/pkg/yurthub/storage/disk"
 )
 
 var (
@@ -57,13 +64,15 @@ func TestServeHTTPForWatch(t *testing.T) {
 	}
 	sWrapper := cachemanager.NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	cacheM, _ := cachemanager.NewCacheManager(sWrapper, serializerM)
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, nil, configManager)
 
 	fn := func() bool {
 		return false
 	}
 
-	lp := NewLocalProxy(cacheM, fn)
+	lp := NewLocalProxy(cacheM, fn, 0)
 
 	testcases := map[string]struct {
 		userAgent string
@@ -89,7 +98,7 @@ func TestServeHTTPForWatch(t *testing.T) {
 			verb:      "GET",
 			path:      "/api/v1/nodes?watch=true",
 			code:      http.StatusOK,
-			ceil:      1 * time.Second,
+			ceil:      61 * time.Second,
 		},
 	}
 
@@ -136,6 +145,10 @@ func TestServeHTTPForWatch(t *testing.T) {
 			}
 		})
 	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
 }
 
 func TestServeHTTPForWatchWithHealthyChange(t *testing.T) {
@@ -145,7 +158,9 @@ func TestServeHTTPForWatchWithHealthyChange(t *testing.T) {
 	}
 	sWrapper := cachemanager.NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	cacheM, _ := cachemanager.NewCacheManager(sWrapper, serializerM)
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, nil, configManager)
 
 	cnt := 0
 	fn := func() bool {
@@ -153,7 +168,7 @@ func TestServeHTTPForWatchWithHealthyChange(t *testing.T) {
 		return cnt > 2 // after 6 seconds, become healthy
 	}
 
-	lp := NewLocalProxy(cacheM, fn)
+	lp := NewLocalProxy(cacheM, fn, 0)
 
 	testcases := map[string]struct {
 		userAgent string
@@ -218,8 +233,105 @@ func TestServeHTTPForWatchWithHealthyChange(t *testing.T) {
 			}
 		})
 	}
-}
 
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
+}
+func TestServeHTTPForWatchWithMinRequestTimeout(t *testing.T) {
+	dStorage, err := disk.NewDiskStorage(rootDir)
+	if err != nil {
+		t.Errorf("failed to create disk storage, %v", err)
+	}
+	sWrapper := cachemanager.NewStorageWrapper(dStorage)
+	serializerM := serializer.NewSerializerManager()
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, nil, configManager)
+
+	fn := func() bool {
+		return false
+	}
+
+	lp := NewLocalProxy(cacheM, fn, 10*time.Second)
+
+	testcases := map[string]struct {
+		userAgent string
+		accept    string
+		verb      string
+		path      string
+		code      int
+		floor     time.Duration
+		ceil      time.Duration
+	}{
+		"watch request": {
+			userAgent: "kubelet",
+			accept:    "application/json",
+			verb:      "GET",
+			path:      "/api/v1/nodes?watch=true&timeoutSeconds=5",
+			code:      http.StatusOK,
+			floor:     5 * time.Second,
+			ceil:      6 * time.Second,
+		},
+		"watch request without timeout": {
+			userAgent: "kubelet",
+			accept:    "application/json",
+			verb:      "GET",
+			path:      "/api/v1/nodes?watch=true",
+			code:      http.StatusOK,
+			floor:     10 * time.Second,
+			ceil:      20 * time.Second,
+		},
+	}
+
+	resolver := newTestRequestInfoResolver()
+
+	for k, tt := range testcases {
+		t.Run(k, func(t *testing.T) {
+			req, _ := http.NewRequest(tt.verb, tt.path, nil)
+			if len(tt.accept) != 0 {
+				req.Header.Set("Accept", tt.accept)
+			}
+
+			if len(tt.userAgent) != 0 {
+				req.Header.Set("User-Agent", tt.userAgent)
+			}
+			req.RemoteAddr = "127.0.0.1"
+
+			var start, end time.Time
+			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				start = time.Now()
+				lp.ServeHTTP(w, req)
+				end = time.Now()
+			})
+
+			handler = proxyutil.WithRequestClientComponent(handler)
+			handler = proxyutil.WithRequestContentType(handler)
+			handler = filters.WithRequestInfo(handler, resolver)
+
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			result := resp.Result()
+			if result.StatusCode != tt.code {
+				t.Errorf("got status code %d, but expect %d", result.StatusCode, tt.code)
+			}
+
+			if tt.floor.Seconds() != 0 {
+				if start.Add(tt.floor).After(end) {
+					t.Errorf("exec time is less than floor time %v", tt.floor)
+				}
+			}
+
+			if start.Add(tt.ceil).Before(end) {
+				t.Errorf("exec time is more than ceil time %v", tt.ceil)
+			}
+		})
+	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
+}
 func TestServeHTTPForPost(t *testing.T) {
 	dStorage, err := disk.NewDiskStorage(rootDir)
 	if err != nil {
@@ -227,13 +339,15 @@ func TestServeHTTPForPost(t *testing.T) {
 	}
 	sWrapper := cachemanager.NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	cacheM, _ := cachemanager.NewCacheManager(sWrapper, serializerM)
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, nil, configManager)
 
 	fn := func() bool {
 		return false
 	}
 
-	lp := NewLocalProxy(cacheM, fn)
+	lp := NewLocalProxy(cacheM, fn, 0)
 
 	testcases := map[string]struct {
 		userAgent string
@@ -294,6 +408,10 @@ func TestServeHTTPForPost(t *testing.T) {
 			}
 		})
 	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
 }
 
 func TestServeHTTPForDelete(t *testing.T) {
@@ -303,13 +421,15 @@ func TestServeHTTPForDelete(t *testing.T) {
 	}
 	sWrapper := cachemanager.NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	cacheM, _ := cachemanager.NewCacheManager(sWrapper, serializerM)
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, nil, configManager)
 
 	fn := func() bool {
 		return false
 	}
 
-	lp := NewLocalProxy(cacheM, fn)
+	lp := NewLocalProxy(cacheM, fn, 0)
 
 	testcases := map[string]struct {
 		userAgent string
@@ -323,7 +443,7 @@ func TestServeHTTPForDelete(t *testing.T) {
 			accept:    "application/json",
 			verb:      "DELETE",
 			path:      "/api/v1/nodes/mynode",
-			code:      http.StatusOK,
+			code:      http.StatusForbidden,
 		},
 	}
 
@@ -357,6 +477,10 @@ func TestServeHTTPForDelete(t *testing.T) {
 			}
 		})
 	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
 }
 
 func TestServeHTTPForGetReqCache(t *testing.T) {
@@ -366,24 +490,26 @@ func TestServeHTTPForGetReqCache(t *testing.T) {
 	}
 	sWrapper := cachemanager.NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	cacheM, _ := cachemanager.NewCacheManager(sWrapper, serializerM)
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, nil, configManager)
 
 	fn := func() bool {
 		return false
 	}
 
-	lp := NewLocalProxy(cacheM, fn)
+	lp := NewLocalProxy(cacheM, fn, 0)
 
 	testcases := map[string]struct {
-		userAgent string
-		keyPrefix string
-		inputObj  []runtime.Object
-		accept    string
-		verb      string
-		path      string
-		resource  string
-		code      int
-		data      struct {
+		userAgent    string
+		keyBuildInfo storage.KeyBuildInfo
+		inputObj     []runtime.Object
+		accept       string
+		verb         string
+		path         string
+		resource     string
+		code         int
+		data         struct {
 			ns   string
 			name string
 			rv   string
@@ -391,7 +517,13 @@ func TestServeHTTPForGetReqCache(t *testing.T) {
 	}{
 		"get pod request": {
 			userAgent: "kubelet",
-			keyPrefix: "kubelet/pods/default",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "pods",
+				Namespace: "default",
+				Group:     "",
+				Version:   "v1",
+			},
 			inputObj: []runtime.Object{
 				&v1.Pod{
 					TypeMeta: metav1.TypeMeta{
@@ -425,12 +557,19 @@ func TestServeHTTPForGetReqCache(t *testing.T) {
 	resolver := newTestRequestInfoResolver()
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
-			jsonDecoder, _ := serializerM.CreateSerializers(tt.accept, "", "v1", tt.resource)
+			s := serializerM.CreateSerializer(tt.accept, "", "v1", tt.resource)
 			accessor := meta.NewAccessor()
 			for i := range tt.inputObj {
 				name, _ := accessor.Name(tt.inputObj[i])
-				key := filepath.Join(tt.keyPrefix, name)
-				_ = sWrapper.Update(key, tt.inputObj[i])
+				tt.keyBuildInfo.Name = name
+				key, err := sWrapper.KeyFunc(tt.keyBuildInfo)
+				if err != nil {
+					t.Errorf("failed to get key of obj, %v", err)
+				}
+				err = sWrapper.Create(key, tt.inputObj[i])
+				if err != nil {
+					t.Errorf("failed to create obj in storage, %v", err)
+				}
 			}
 
 			req, _ := http.NewRequest(tt.verb, tt.path, nil)
@@ -459,12 +598,12 @@ func TestServeHTTPForGetReqCache(t *testing.T) {
 			}
 
 			buf := bytes.NewBuffer([]byte{})
-			_, err := buf.ReadFrom(result.Body)
+			_, err = buf.ReadFrom(result.Body)
 			if err != nil {
 				t.Errorf("read from result body failed, %v", err)
 			}
 
-			obj, _, err := jsonDecoder.Decoder.Decode(buf.Bytes(), nil, nil)
+			obj, err := s.Decode(buf.Bytes())
 			if err != nil {
 				t.Errorf("decode response failed, %v", err)
 			}
@@ -486,11 +625,15 @@ func TestServeHTTPForGetReqCache(t *testing.T) {
 				t.Errorf("Got rv %s, but expect rv %s", pod.ResourceVersion, tt.data.rv)
 			}
 
-			err = sWrapper.DeleteCollection("kubelet")
+			err = sWrapper.DeleteComponentResources("kubelet")
 			if err != nil {
 				t.Errorf("failed to delete collection: kubelet, %v", err)
 			}
 		})
+	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
 	}
 }
 
@@ -498,35 +641,46 @@ func TestServeHTTPForListReqCache(t *testing.T) {
 	dStorage, err := disk.NewDiskStorage(rootDir)
 	if err != nil {
 		t.Errorf("failed to create disk storage, %v", err)
+		return
 	}
 	sWrapper := cachemanager.NewStorageWrapper(dStorage)
 	serializerM := serializer.NewSerializerManager()
-	cacheM, _ := cachemanager.NewCacheManager(sWrapper, serializerM)
+	restRESTMapperMgr, _ := hubmeta.NewRESTMapperManager(rootDir)
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, restRESTMapperMgr, configManager)
 
 	fn := func() bool {
 		return false
 	}
 
-	lp := NewLocalProxy(cacheM, fn)
+	lp := NewLocalProxy(cacheM, fn, 0)
 
 	testcases := map[string]struct {
-		userAgent string
-		keyPrefix string
-		inputObj  []runtime.Object
-		accept    string
-		verb      string
-		path      string
-		resource  string
-		code      int
-		expectD   struct {
+		userAgent    string
+		keyBuildInfo storage.KeyBuildInfo
+		preCachedObj []runtime.Object
+		accept       string
+		verb         string
+		path         string
+		resource     string
+		gvr          schema.GroupVersionResource
+		code         int
+		expectD      struct {
 			rv   string
 			data map[string]struct{}
 		}
 	}{
 		"list pods request": {
 			userAgent: "kubelet",
-			keyPrefix: "kubelet/pods/default",
-			inputObj: []runtime.Object{
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "pods",
+				Namespace: "default",
+				Group:     "",
+				Version:   "v1",
+			},
+			preCachedObj: []runtime.Object{
 				&v1.Pod{
 					TypeMeta: metav1.TypeMeta{
 						APIVersion: "v1",
@@ -578,17 +732,46 @@ func TestServeHTTPForListReqCache(t *testing.T) {
 				},
 			},
 		},
+		"list unregistered resource(Foo) request": {
+			userAgent: "kubelet",
+			keyBuildInfo: storage.KeyBuildInfo{
+				Component: "kubelet",
+				Resources: "foos",
+				Group:     "samplecontroller.k8s.io",
+				Version:   "v1",
+			},
+			preCachedObj: []runtime.Object{},
+			accept:       "application/json",
+			verb:         "GET",
+			path:         "/api/samplecontroller.k8s.io/v1/foos",
+			resource:     "foos",
+			gvr:          schema.GroupVersionResource{Group: "samplecontroller.k8s.io", Version: "v1", Resource: "foos"},
+			code:         http.StatusNotFound,
+			expectD: struct {
+				rv   string
+				data map[string]struct{}
+			}{
+				data: map[string]struct{}{},
+			},
+		},
 	}
 
 	resolver := newTestRequestInfoResolver()
 	for k, tt := range testcases {
 		t.Run(k, func(t *testing.T) {
-			jsonDecoder, _ := serializerM.CreateSerializers(tt.accept, "", "v1", tt.resource)
+			s := serializerM.CreateSerializer(tt.accept, "", "v1", tt.resource)
 			accessor := meta.NewAccessor()
-			for i := range tt.inputObj {
-				name, _ := accessor.Name(tt.inputObj[i])
-				key := filepath.Join(tt.keyPrefix, name)
-				_ = sWrapper.Update(key, tt.inputObj[i])
+			for i := range tt.preCachedObj {
+				name, _ := accessor.Name(tt.preCachedObj[i])
+				tt.keyBuildInfo.Name = name
+				key, err := sWrapper.KeyFunc(tt.keyBuildInfo)
+				if err != nil {
+					t.Errorf("failed to get key of obj, %v", err)
+				}
+				err = sWrapper.Create(key, tt.preCachedObj[i])
+				if err != nil {
+					t.Errorf("failed to create obj in storage, %v", err)
+				}
 			}
 
 			req, _ := http.NewRequest(tt.verb, tt.path, nil)
@@ -612,17 +795,24 @@ func TestServeHTTPForListReqCache(t *testing.T) {
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
 			result := resp.Result()
+			// For unregistered resources, server should return 404 not found
+			if result.StatusCode == http.StatusNotFound {
+				if _, gvk := restRESTMapperMgr.KindFor(tt.gvr); !gvk.Empty() {
+					t.Errorf("this resources %v is registered, but it should return 404 for unregistered resource", tt.gvr)
+				}
+				return
+			}
 			if result.StatusCode != tt.code {
 				t.Errorf("got status code %d, but expect %d", result.StatusCode, tt.code)
 			}
 
 			buf := bytes.NewBuffer([]byte{})
-			_, err := buf.ReadFrom(result.Body)
+			_, err = buf.ReadFrom(result.Body)
 			if err != nil {
 				t.Errorf("read from result body failed, %v", err)
 			}
 
-			obj, _, err := jsonDecoder.Decoder.Decode(buf.Bytes(), nil, nil)
+			obj, err := s.Decode(buf.Bytes())
 			if err != nil {
 				t.Errorf("decode response failed, %v", err)
 			}
@@ -637,7 +827,7 @@ func TestServeHTTPForListReqCache(t *testing.T) {
 			}
 
 			if len(list.Items) != len(tt.expectD.data) {
-				t.Errorf("Got %d pods, but exepect %d pods", len(list.Items), len(tt.expectD.data))
+				t.Errorf("Got %d pods, but expect %d pods", len(list.Items), len(tt.expectD.data))
 			}
 
 			for i := range list.Items {
@@ -647,10 +837,96 @@ func TestServeHTTPForListReqCache(t *testing.T) {
 				}
 			}
 
-			err = sWrapper.DeleteCollection("kubelet")
+			err = sWrapper.DeleteComponentResources("kubelet")
 			if err != nil {
 				t.Errorf("failed to delete collection: kubelet, %v", err)
 			}
 		})
+	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
+	}
+}
+
+func TestLocalDeleteWithNilRequestInfo(t *testing.T) {
+	testcases := map[string]struct {
+		verb string
+		path string
+	}{
+		"delete request without RequestInfo": {
+			verb: "DELETE",
+			path: "/api/v1/nodes/mynode",
+		},
+	}
+
+	for k, tt := range testcases {
+		t.Run(k, func(t *testing.T) {
+			req, _ := http.NewRequest(tt.verb, tt.path, nil)
+			w := httptest.NewRecorder()
+
+			err := localDelete(w, req)
+
+			if err == nil {
+				t.Error("expected error when RequestInfo is nil, got nil")
+				return
+			}
+			statusErr, ok := err.(apierrors.APIStatus)
+			if !ok {
+				t.Errorf("expected APIStatus error, got %T", err)
+				return
+			}
+			if statusErr.Status().Code != http.StatusInternalServerError {
+				t.Errorf("expected 500 InternalServerError, got %d", statusErr.Status().Code)
+			}
+		})
+	}
+}
+
+func TestLocalPostWithNilRequestInfo(t *testing.T) {
+	dStorage, err := disk.NewDiskStorage(rootDir)
+	if err != nil {
+		t.Errorf("failed to create disk storage, %v", err)
+		return
+	}
+	sWrapper := cachemanager.NewStorageWrapper(dStorage)
+	serializerM := serializer.NewSerializerManager()
+	fakeSharedInformerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	configManager := configuration.NewConfigurationManager("node1", fakeSharedInformerFactory)
+	cacheM := cachemanager.NewCacheManager(sWrapper, serializerM, nil, configManager)
+
+	fn := func() bool {
+		return false
+	}
+	lp := NewLocalProxy(cacheM, fn, 0)
+
+	testcases := map[string]struct {
+		verb string
+		path string
+		data string
+	}{
+		"post request without RequestInfo": {
+			verb: "POST",
+			path: "/api/v1/nodes/mynode",
+			data: "test",
+		},
+	}
+
+	for k, tt := range testcases {
+		t.Run(k, func(t *testing.T) {
+			req, _ := http.NewRequest(tt.verb, tt.path, bytes.NewBufferString(tt.data))
+			req.Header.Set("Content-Length", fmt.Sprintf("%d", len(tt.data)))
+			w := httptest.NewRecorder()
+
+			err := lp.localPost(w, req)
+
+			if err == nil {
+				t.Error("expected error when RequestInfo is nil, got nil")
+			}
+		})
+	}
+
+	if err = os.RemoveAll(rootDir); err != nil {
+		t.Errorf("Got error %v, unable to remove path %s", err, rootDir)
 	}
 }

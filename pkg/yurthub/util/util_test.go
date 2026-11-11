@@ -18,16 +18,81 @@ package util
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
 	"io"
-	"io/ioutil"
+	"net/http"
+	"net/url"
+	"os"
 	"testing"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
+
+func TestContext(t *testing.T) {
+	ctx := context.Background()
+	reqContentType, ok := ReqContentTypeFrom(ctx)
+	if ok || reqContentType != "" {
+		t.Errorf("want clean context, got value %s, ok:%v", reqContentType, ok)
+		return
+	}
+	testReqContentType := "testReqContentType"
+	ctxWithReqContentType := WithReqContentType(ctx, testReqContentType)
+	reqContentType, ok = ReqContentTypeFrom(ctxWithReqContentType)
+	if !ok || reqContentType != testReqContentType {
+		t.Errorf("want reqContentType, got value %s, ok:%v", reqContentType, ok)
+		return
+	}
+
+	respContentType, ok := RespContentTypeFrom(ctx)
+	if ok || respContentType != "" {
+		t.Errorf("want clean context, got value %s, ok:%v", respContentType, ok)
+		return
+	}
+	testRespContentType := "testRespContentType"
+	ctxWithRespContentType := WithRespContentType(ctx, testRespContentType)
+	respContentType, ok = RespContentTypeFrom(ctxWithRespContentType)
+	if !ok || respContentType != testRespContentType {
+		t.Errorf("want respContentType, got value %s, ok:%v", respContentType, ok)
+		return
+	}
+
+	clientComponent, ok := ClientComponentFrom(ctx)
+	if ok || clientComponent != "" {
+		t.Errorf("want clean context, got value %s, ok:%v", clientComponent, ok)
+		return
+	}
+	testClientComponent := "testClientComponent"
+	ctxWithClientComponent := WithClientComponent(ctx, testClientComponent)
+	clientComponent, ok = ClientComponentFrom(ctxWithClientComponent)
+	if !ok || clientComponent != testClientComponent {
+		t.Errorf("want clientComponent, got value %s, ok:%v", clientComponent, ok)
+		return
+	}
+
+	listSelectorFrom, ok := ListSelectorFrom(ctx)
+	if ok || listSelectorFrom != "" {
+		t.Errorf("want clean context, got value %v, ok:%v", listSelectorFrom, ok)
+		return
+	}
+	testListSelectorFrom := "testListSelectorFrom"
+	ctxWithListSelector := WithListSelector(ctx, testListSelectorFrom)
+	listSelectorFrom, ok = ListSelectorFrom(ctxWithListSelector)
+	if !ok || listSelectorFrom != testListSelectorFrom {
+		t.Errorf("want listSelectorFrom, got value %v, ok:%v", listSelectorFrom, ok)
+		return
+	}
+}
 
 func TestDualReader(t *testing.T) {
 	src := []byte("hello, world")
 	rb := bytes.NewBuffer(src)
-	rc := ioutil.NopCloser(rb)
-	drc, prc := NewDualReadCloser(rc, true)
+	rc := io.NopCloser(rb)
+	drc, prc := NewDualReadCloser(nil, rc, true)
 	rc = drc
 	dst1 := make([]byte, len(src))
 	dst2 := make([]byte, len(src))
@@ -66,8 +131,8 @@ func TestDualReader(t *testing.T) {
 func TestDualReaderByPreClose(t *testing.T) {
 	src := []byte("hello, world")
 	rb := bytes.NewBuffer(src)
-	rc := ioutil.NopCloser(rb)
-	drc, prc := NewDualReadCloser(rc, true)
+	rc := io.NopCloser(rb)
+	drc, prc := NewDualReadCloser(nil, rc, true)
 	rc = drc
 	dst := make([]byte, len(src))
 
@@ -75,81 +140,8 @@ func TestDualReaderByPreClose(t *testing.T) {
 		t.Errorf("prc.Close failed %v", err)
 	}
 
-	if n, err := io.ReadFull(rc, dst); n != 0 || err != io.ErrClosedPipe {
+	if n, err := io.ReadFull(rc, dst); n != 0 || !errors.Is(err, io.ErrClosedPipe) {
 		t.Errorf("closed dualReadCloser: ReadFull(r, dst) = %d, %v; want 0, EPIPE", n, err)
-	}
-}
-
-func TestKeyFunc(t *testing.T) {
-	type expectData struct {
-		err bool
-		key string
-	}
-	tests := []struct {
-		desc     string
-		comp     string
-		resource string
-		ns       string
-		name     string
-		result   expectData
-	}{
-		{
-			desc:   "no resource",
-			comp:   "kubelet",
-			result: expectData{err: true},
-		},
-		{
-			desc:     "no comp",
-			resource: "pods",
-			result:   expectData{err: true},
-		},
-		{
-			desc:     "with comp and resource",
-			comp:     "kubelet",
-			resource: "pods",
-			result:   expectData{key: "kubelet/pods"},
-		},
-		{
-			desc:     "with comp resource and ns",
-			comp:     "kubelet",
-			resource: "pods",
-			ns:       "default",
-			result:   expectData{key: "kubelet/pods/default"},
-		},
-		{
-			desc:     "with comp resource and name",
-			comp:     "kubelet",
-			resource: "pods",
-			name:     "mypod1",
-			result:   expectData{key: "kubelet/pods/mypod1"},
-		},
-		{
-			desc:     "with all items",
-			comp:     "kubelet",
-			resource: "pods",
-			ns:       "default",
-			name:     "mypod1",
-			result:   expectData{key: "kubelet/pods/default/mypod1"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.desc, func(t *testing.T) {
-			key, err := KeyFunc(tt.comp, tt.resource, tt.ns, tt.name)
-			if tt.result.err {
-				if err == nil {
-					t.Errorf("expect error returned, but not error")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Got error %v", err)
-				}
-
-				if key != tt.result.key {
-					t.Errorf("%s Expect, but got %s", tt.result.key, key)
-				}
-			}
-		})
 	}
 }
 
@@ -214,6 +206,284 @@ func TestSplitKey(t *testing.T) {
 				ns != tt.result.ns ||
 				name != tt.result.name {
 				t.Errorf("%v expect, but go %s/%s/%s/%s", tt.result, comp, resource, ns, name)
+			}
+		})
+	}
+}
+
+func TestParseTenantNs(t *testing.T) {
+
+	testCases := map[string]string{
+		"a":                       "",
+		"openyurt:tenant:myspace": "myspace",
+	}
+
+	for k, v := range testCases {
+
+		ns := ParseTenantNs(k)
+		if v != ns {
+			t.Errorf("%s is not equal to %s", v, ns)
+		}
+
+	}
+
+	token := "ZXlKaGJHY2lPaUpTVXpJMU5pSXNJbXRwWkNJNkluVmZUVlpwWldJeVNVRlVUelE0Tmpsa00wVndUbEJSYjB4Sk9XVktVR2cxWlhWemJFZGFZMFp4Y2tFaWZRLmV5SnBjM01pT2lKcmRXSmxjbTVsZEdWekwzTmxjblpwWTJWaFkyTnZkVzUwSWl3aWEzVmlaWEp1WlhSbGN5NXBieTl6WlhKMmFXTmxZV05qYjNWdWRDOXVZVzFsYzNCaFkyVWlPaUpwYjNRdGRHVnpkQ0lzSW10MVltVnlibVYwWlhNdWFXOHZjMlZ5ZG1salpXRmpZMjkxYm5RdmMyVmpjbVYwTG01aGJXVWlPaUprWldaaGRXeDBMWFJ2YTJWdUxYRjNjMlp0SWl3aWEzVmlaWEp1WlhSbGN5NXBieTl6WlhKMmFXTmxZV05qYjNWdWRDOXpaWEoyYVdObExXRmpZMjkxYm5RdWJtRnRaU0k2SW1SbFptRjFiSFFpTENKcmRXSmxjbTVsZEdWekxtbHZMM05sY25acFkyVmhZMk52ZFc1MEwzTmxjblpwWTJVdFlXTmpiM1Z1ZEM1MWFXUWlPaUk0TTJFd016YzRaUzFtWTJVeExUUm1aREV0T0dJMU5DMDBNVEUyTWpVell6TmtZV01pTENKemRXSWlPaUp6ZVhOMFpXMDZjMlZ5ZG1salpXRmpZMjkxYm5RNmFXOTBMWFJsYzNRNlpHVm1ZWFZzZENKOS5QM2xuc3NWSTZvVUg2U19CX2thYU1QWmV5Vm8xM2xCQU50aGVvb3ByY1ZnQWlIWXpNOVdBcUFPTi12c2h5RTBBcUFHTFl3Q1FsY0FReXhKNDZqbEd0TXJxUlhpRWIyMldobXVtRkswc3NNTGJkbHBOWmJjNzc5WmxoeXUyVDJnRTlKSExFMHUyUFkwQm5sQUlQZmtGYzZPZk9veklybDBGZUxGWklFY1MzQi1yTlUwYUZDekJZNEpsMThYdUpKOEhubHA4N3V1Q2FlLUZzWHJWajFIZUd4MWw4S2JzZVJwSkFrN0Q0aklPNDFndXRlSHV5MnE3SldHLUwyWWZ0VG1peWdEb2pqMlhFTkEyTkxrRXFLbG5NQ3BlSjFwUl82UjRKZ21OaTUzLWktTE5mTVNGWXNnckNMUWNNTkhiZkg1MEpBOXp0cHd1Y2xmWUl3WjBPZkdPOWc="
+
+	out, _ := base64.StdEncoding.DecodeString(token)
+	t.Logf("token: %s", string(out))
+}
+
+func TestIsSupportedLBMode(t *testing.T) {
+	type args struct {
+		lbMode string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{"lb mode rr", args{"rr"}, true},
+		{"lb mode priority", args{"priority"}, true},
+		{"no lb mode", args{""}, false},
+		{"illegal lb mode", args{"illegal-mode"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsSupportedLBMode(tt.args.lbMode); got != tt.want {
+				t.Errorf("IsSupportedLBMode() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsSupportedWorkingMode(t *testing.T) {
+	type args struct {
+		workingMode WorkingMode
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{"working mode cloud", args{WorkingModeCloud}, true},
+		{"working mode edge", args{WorkingModeEdge}, true},
+		{"working mode local", args{WorkingModeLocal}, true},
+		{"no working mode", args{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsSupportedWorkingMode(tt.args.workingMode); got != tt.want {
+				t.Errorf("IsSupportedWorkingMode() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFileExists(t *testing.T) {
+	dir, err := os.MkdirTemp("", "yurthub-util-file-exist")
+	if err != nil {
+		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("Unable to clean up test directory %q: %v", dir, err)
+		}
+	}()
+	testExistFile := dir + "test.txt"
+	if err = os.WriteFile(testExistFile, nil, 0600); err != nil {
+		t.Fatalf("Unable to create the test file %q: %v", testExistFile, err)
+	}
+	testNotExistFile := dir + "not-exist-test.txt"
+	type args struct {
+		filename string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    bool
+		wantErr bool
+	}{
+		{"file exists", args{testExistFile}, true, false},
+		{"file not exists", args{testNotExistFile}, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := FileExists(tt.args.filename)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("FileExists() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("FileExists() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseTenantNsFromOrgs(t *testing.T) {
+	type args struct {
+		orgs []string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{"no orgs", args{}, ""},
+		{"no tenant in orgs", args{[]string{"org1", "org2"}}, ""},
+		{"there is tenant in orgs", args{[]string{"org1", "org2", "openyurt:tenant:special-tenant"}}, "special-tenant"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ParseTenantNsFromOrgs(tt.args.orgs); got != tt.want {
+				t.Errorf("ParseTenantNsFromOrgs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseBearerToken(t *testing.T) {
+	type args struct {
+		token string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{"no token", args{}, ""},
+		{"no bearer token", args{"some-token"}, ""},
+		{"there is bearer token", args{"Bearer token-content"}, "token-content"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ParseBearerToken(tt.args.token); got != tt.want {
+				t.Errorf("ParseBearerToken() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewGZipReaderCloser(t *testing.T) {
+	gzipHeader := http.Header{}
+	gzipHeader.Set("Content-Encoding", "gzip")
+	noGZipHeader := http.Header{}
+	noGZipHeader.Set("Some-Header", "value")
+	type args struct {
+		header http.Header
+		src    []byte
+		req    *http.Request
+		caller string
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want1 bool
+	}{
+		{"no header", args{}, false},
+		{"no gzip header", args{header: noGZipHeader}, false},
+		{"valid gzip header", args{header: gzipHeader, src: []byte("Hello World"), req: &http.Request{URL: &url.URL{Host: "http://127.0.0.1"}, Header: gzipHeader}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rb := bytes.NewBuffer(tt.args.src)
+			rc := io.NopCloser(rb)
+			_, got1 := NewGZipReaderCloser(tt.args.header, rc, tt.args.req, tt.args.caller)
+			if got1 != tt.want1 {
+				t.Errorf("NewGZipReaderCloser() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestReqInfoString(t *testing.T) {
+	type args struct {
+		info *apirequest.RequestInfo
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{"nil request", args{}, ""},
+		{"valid request", args{
+			&apirequest.RequestInfo{
+				Verb:     http.MethodGet,
+				Resource: "services",
+				Path:     "/api/v1/namespaces/default/services?watch=true",
+			},
+		}, "GET services for /api/v1/namespaces/default/services?watch=true"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ReqInfoString(tt.args.info); got != tt.want {
+				t.Errorf("ReqInfoString() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNodeConditionsHaveChanged(t *testing.T) {
+	tests := []struct {
+		name         string
+		originalNode *v1.Node
+		node         *v1.Node
+		changed      bool
+	}{
+		{
+			name: "test1",
+			originalNode: &v1.Node{
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:              v1.NodeReady,
+							LastHeartbeatTime: metav1.Now(),
+						},
+					},
+				},
+			},
+			node: &v1.Node{
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:              v1.NodeReady,
+							LastHeartbeatTime: metav1.NewTime(time.Now().Add(10 * time.Minute)),
+						},
+					},
+				},
+			},
+			changed: false,
+		},
+		{
+			name: "test2",
+			originalNode: &v1.Node{
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:    v1.NodeReady,
+							Message: "test1",
+						},
+					},
+				},
+			},
+			node: &v1.Node{
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:    v1.NodeReady,
+							Message: "test2",
+						},
+					},
+				},
+			},
+			changed: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := NodeConditionsHaveChanged(test.originalNode.Status.Conditions, test.node.Status.Conditions)
+			if c != test.changed {
+				t.Errorf("%s, expect %v but get %v", test.name, test.changed, c)
 			}
 		})
 	}

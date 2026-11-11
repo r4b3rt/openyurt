@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/openyurtio/openyurt/cmd/yurthub/app/config"
-	"github.com/openyurtio/openyurt/pkg/yurthub/certificate/interfaces"
+	yurtutil "github.com/openyurtio/openyurt/pkg/util"
+	"github.com/openyurtio/openyurt/pkg/yurthub/certificate"
 )
 
 const (
@@ -31,7 +31,7 @@ const (
 
 // updateTokenHandler returns a http handler that update bootstrap token in the bootstrap-hub.conf file
 // in order to update node certificate when both node certificate and old join token expires
-func updateTokenHandler(certificateMgr interfaces.YurtCertificateManager) http.Handler {
+func updateTokenHandler(certificateMgr certificate.YurtCertificateManager) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tokens := make(map[string]string)
 		decoder := json.NewDecoder(r.Body)
@@ -49,7 +49,7 @@ func updateTokenHandler(certificateMgr interfaces.YurtCertificateManager) http.H
 			return
 		}
 
-		err = certificateMgr.Update(&config.YurtHubConfiguration{JoinToken: joinToken})
+		err = certificateMgr.UpdateBootstrapConf(joinToken)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintf(w, "could not update bootstrap token, %v", err)
@@ -57,8 +57,7 @@ func updateTokenHandler(certificateMgr interfaces.YurtCertificateManager) http.H
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(yurtutil.HTTPHeaderContentType, yurtutil.HTTPContentTypeJSON)
 		fmt.Fprintf(w, "update bootstrap token successfully")
-		return
 	})
 }

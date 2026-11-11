@@ -17,23 +17,27 @@ limitations under the License.
 package constants
 
 const (
-	YurttunnelServerAgentPort          = "10262"
-	YurttunnelServerMasterPort         = "10263"
-	YurttunnelServerMasterInsecurePort = "10264"
-	YurttunnelServerMetaPort           = "10265"
-	YurttunnelAgentMetaPort            = "10266"
-	YurttunnelServerServiceNs          = "kube-system"
-	YurttunnelServerServiceName        = "x-tunnel-server-svc"
-	YurttunnelServerAgentPortName      = "tcp"
-	YurttunnelServerExternalAddrKey    = "x-tunnel-server-external-addr"
-	YurttunnelEndpointsNs              = "kube-system"
-	YurttunnelEndpointsName            = "x-tunnel-server-svc"
+	YurttunnelServerAgentPort           = "10262"
+	YurttunnelServerMasterPort          = "10263"
+	YurttunnelServerMasterInsecurePort  = "10264"
+	YurttunnelServerMetaPort            = "10265"
+	YurtTunnelServerNodeName            = "tunnel-server"
+	YurttunnelAgentMetaPort             = "10266"
+	YurttunnelServerServiceNs           = "kube-system"
+	YurttunnelServerInternalServiceName = "x-tunnel-server-internal-svc"
+	YurttunnelServerServiceName         = "x-tunnel-server-svc"
+	YurttunnelServerAgentPortName       = "tcp"
+	YurttunnelServerExternalAddrKey     = "x-tunnel-server-external-addr"
+	YurttunnelEndpointsNs               = "kube-system"
+	YurttunnelEndpointsName             = "x-tunnel-server-svc"
+	YurttunnelDNSRecordConfigMapNs      = "kube-system"
+	YurttunnelDNSRecordConfigMapName    = "%s-tunnel-nodes"
+	YurttunnelDNSRecordNodeDataKey      = "tunnel-nodes"
+	YurtTunnelProxyClientCSRCN          = "tunnel-proxy-client"
+	YurtTunnelCSROrg                    = "openyurt:yurttunnel"
+	YurtTunnelAgentCSRCN                = "tunnel-agent-client"
 
 	// yurttunnel PKI related constants
-	YurttunnelCSROrg                 = "openyurt:yurttunnel"
-	YurttunnelAgentCSRCN             = "yurttunnel-agent"
-	YurttunneServerCSROrg            = "system:masters"
-	YurttunneServerCSRCN             = "kube-apiserver-kubelet-client"
 	YurttunnelCAFile                 = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	YurttunnelTokenFile              = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	YurttunnelServerCertDir          = "/var/lib/%s/pki"
@@ -42,6 +46,11 @@ const (
 
 	// name of the environment variables used in pod
 	YurttunnelAgentPodIPEnv = "POD_IP"
+
+	// name of the environment for selecting backend agent used in yurt-tunnel-server
+	NodeIPKeyIndex     = "status.internalIP"
+	ProxyHostHeaderKey = "X-Tunnel-Proxy-Host"
+	ProxyDestHeaderKey = "X-Tunnel-Proxy-Dest"
 
 	// The timeout seconds of reading a complete request from the apiserver
 	YurttunnelANPInterceptorReadTimeoutSec = 10
@@ -53,4 +62,8 @@ const (
 	YurttunnelANPGrpcKeepAliveTimeSec = 10
 	// wait 5 seconds for the probe ack before cutting the connection
 	YurttunnelANPGrpcKeepAliveTimeoutSec = 5
+	UnixListenerNetwork                  = "unix"
+)
+const (
+	HTTPSPrefix = "https://"
 )

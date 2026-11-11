@@ -17,21 +17,27 @@ limitations under the License.
 package app
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"os"
+	"time"
+
+	"github.com/spf13/cobra"
+	certificatesv1 "k8s.io/api/certificates/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/certificate"
+	"k8s.io/klog/v2"
 
 	"github.com/openyurtio/openyurt/cmd/yurt-tunnel-agent/app/config"
 	"github.com/openyurtio/openyurt/cmd/yurt-tunnel-agent/app/options"
 	"github.com/openyurtio/openyurt/pkg/projectinfo"
+	"github.com/openyurtio/openyurt/pkg/util/certmanager"
+	certfactory "github.com/openyurtio/openyurt/pkg/util/certmanager/factory"
 	"github.com/openyurtio/openyurt/pkg/yurttunnel/agent"
 	"github.com/openyurtio/openyurt/pkg/yurttunnel/constants"
-	"github.com/openyurtio/openyurt/pkg/yurttunnel/pki"
-	"github.com/openyurtio/openyurt/pkg/yurttunnel/pki/certmanager"
 	"github.com/openyurtio/openyurt/pkg/yurttunnel/server/serveraddr"
 	"github.com/openyurtio/openyurt/pkg/yurttunnel/util"
-
-	"github.com/spf13/cobra"
-	"k8s.io/client-go/util/certificate"
-	"k8s.io/klog/v2"
 )
 
 // NewYurttunnelAgentCommand creates a new yurttunnel-agent command
@@ -60,6 +66,7 @@ func NewYurttunnelAgentCommand(stopCh <-chan struct{}) *cobra.Command {
 			}
 			return nil
 		},
+		Args: cobra.NoArgs,
 	}
 
 	agentOptions.AddFlags(cmd.Flags())
@@ -84,15 +91,39 @@ func Run(cfg *config.CompletedConfig, stopCh <-chan struct{}) error {
 	klog.Infof("%s address: %s", projectinfo.GetServerName(), tunnelServerAddr)
 
 	// 2. create a certificate manager
-	agentCertMgr, err =
-		certmanager.NewYurttunnelAgentCertManager(cfg.Client)
+	// As yurttunnel-agent will run on the edge node with Host network mode,
+	// we can use the status.podIP as the node IP
+	nodeIP := os.Getenv(constants.YurttunnelAgentPodIPEnv)
+	if nodeIP == "" {
+		return fmt.Errorf("env %s is not set", constants.YurttunnelAgentPodIPEnv)
+	}
+	agentCertMgr, err = certfactory.NewCertManagerFactory(cfg.Client).New(&certfactory.CertManagerConfig{
+		ComponentName: projectinfo.GetAgentName(),
+		CertDir:       cfg.CertDir,
+		SignerName:    certificatesv1.KubeAPIServerClientSignerName,
+		CommonName:    constants.YurtTunnelAgentCSRCN,
+		Organizations: []string{constants.YurtTunnelCSROrg},
+		DNSNames:      []string{os.Getenv("NODE_NAME")},
+		IPs:           []net.IP{net.ParseIP(nodeIP)},
+	})
 	if err != nil {
 		return err
 	}
 	agentCertMgr.Start()
 
+	// 2.1. waiting for the certificate is generated
+	_ = wait.PollUntilContextCancel(context.Background(), 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		if agentCertMgr.Current() != nil {
+			return true, nil
+		}
+		klog.Infof("certificate %s not signed, waiting...",
+			projectinfo.GetAgentName())
+		return false, nil
+	})
+	klog.Infof("certificate %s ok", projectinfo.GetAgentName())
+
 	// 3. generate a TLS configuration for securing the connection to server
-	tlsCfg, err := pki.GenTLSConfigUseCertMgrAndCA(agentCertMgr,
+	tlsCfg, err := certmanager.GenTLSConfigUseCertMgrAndCA(agentCertMgr,
 		tunnelServerAddr, constants.YurttunnelCAFile)
 	if err != nil {
 		return err

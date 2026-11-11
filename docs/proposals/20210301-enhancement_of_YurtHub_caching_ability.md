@@ -140,7 +140,7 @@ CacheManager provides methods for managing resources cached on edge nodes, which
 ```go
 // CacheManager is an adaptor to cache runtime object data into backend storage
 type CacheManager interface {
-	CacheResponse(ctx context.Context, prc io.ReadCloser, stopCh <-chan struct{}) error
+	CacheResponse(req *http.Request, prc io.ReadCloser, stopCh <-chan struct{}) error
 	QueryCache(req *http.Request) (runtime.Object, error)
 	UpdateCacheAgents(agents []string) error
 	ListCacheAgents() []string
@@ -274,7 +274,7 @@ On the basis of the existing NegotiatedSerializer increase a new unstructuredNeg
 type unstructuredNegotiatedSerializer struct {
 	scheme  *runtime.Scheme
 	typer   runtime.ObjectTyper
-	creator runtime.ObjectCreater
+	creator runtime.ObjectCreator
 }
 
 // SerializerManager is responsible for managing *rest.Serializers
@@ -402,7 +402,7 @@ func (hl *HandlerLayer) GetSelector(gvk schema.GroupVersionKind) *storage.Select
 The followings are the function definitions for object handling using selectors and handlers.
 
 ```go
-//Process uses the registered handlers to process the objects. The obj passed into function shoud not be changed.
+//Process uses the registered handlers to process the objects. The obj passed into function should not be changed.
 func (hl *HandlerLayer) Process(obj runtime.Object) (runtime.Object, error) {
 	gvk := obj.GetObjectKind().GroupVersionKind()
 	handlers := hl.GetHandlers(gvk)

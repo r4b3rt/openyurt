@@ -25,20 +25,40 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/httpstream"
+	"k8s.io/apimachinery/pkg/util/httpstream/wsstream"
 	"k8s.io/apiserver/pkg/util/flushwriter"
-	"k8s.io/apiserver/pkg/util/wsstream"
 	"k8s.io/klog/v2"
+
+	"github.com/openyurtio/openyurt/pkg/yurttunnel/constants"
 )
 
 var (
-	proxyHostHeaderKey     = "X-Tunnel-Proxy-Host"
-	supportedHeaders       = []string{proxyHostHeaderKey, "User-Agent"}
+	supportedHeaders       = []string{constants.ProxyHostHeaderKey, "User-Agent"}
 	HeaderTransferEncoding = "Transfer-Encoding"
 	HeaderChunked          = "chunked"
+	bufioReaderPool        sync.Pool
 )
+
+// newBufioReader retrieves a cached Reader from the pool if the pool is not empty,
+// otherwise creates a new one
+func newBufioReader(r io.Reader) *bufio.Reader {
+	if v := bufioReaderPool.Get(); v != nil {
+		br := v.(*bufio.Reader)
+		br.Reset(r)
+		return br
+	}
+	return bufio.NewReader(r)
+}
+
+// putBufioReader puts the Reader to the pool.
+func putBufioReader(br *bufio.Reader) {
+	br.Reset(nil)
+	bufioReaderPool.Put(br)
+}
 
 // ReqRequestInterceptor intercepts http/https requests sent from the master,
 // prometheus and metric server, setup proxy tunnel to kubelet, sends requests
@@ -56,9 +76,9 @@ func NewRequestInterceptor(udsSockFile string, cfg *tls.Config) *RequestIntercep
 	cfg.InsecureSkipVerify = true
 	contextDialer := func(addr string, header http.Header, isTLS bool) (net.Conn, error) {
 		klog.V(4).Infof("Sending request to %q.", addr)
-		proxyConn, err := net.Dial("unix", udsSockFile)
+		proxyConn, err := net.Dial(constants.UnixListenerNetwork, udsSockFile)
 		if err != nil {
-			return nil, fmt.Errorf("dialing proxy %q failed: %v", udsSockFile, err)
+			return nil, fmt.Errorf("dialing proxy %q failed: %w", udsSockFile, err)
 		}
 
 		var connectHeaders string
@@ -68,12 +88,13 @@ func NewRequestInterceptor(udsSockFile string, cfg *tls.Config) *RequestIntercep
 			}
 		}
 
-		fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: %s%s\r\n\r\n", addr, "127.0.0.1", connectHeaders)
-		br := bufio.NewReader(proxyConn)
+		fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: localhost%s\r\n\r\n", addr, connectHeaders)
+		br := newBufioReader(proxyConn)
+		defer putBufioReader(br)
 		res, err := http.ReadResponse(br, nil)
 		if err != nil {
 			proxyConn.Close()
-			return nil, fmt.Errorf("reading HTTP response from CONNECT to %s via proxy %s failed: %v", addr, udsSockFile, err)
+			return nil, fmt.Errorf("reading HTTP response from CONNECT to %s via proxy %s failed: %w", addr, udsSockFile, err)
 		}
 		if res.StatusCode != 200 {
 			proxyConn.Close()
@@ -86,7 +107,7 @@ func NewRequestInterceptor(udsSockFile string, cfg *tls.Config) *RequestIntercep
 			tlsTunnelConn := tls.Client(proxyConn, cfg)
 			if err := tlsTunnelConn.Handshake(); err != nil {
 				proxyConn.Close()
-				return nil, fmt.Errorf("fail to setup TLS handshake through the Tunnel: %s", err)
+				return nil, fmt.Errorf("could not setup TLS handshake through the Tunnel: %w", err)
 			}
 			klog.V(4).Infof("successfully setup TLS connection to %q with headers: %s", addr, connectHeaders)
 			return tlsTunnelConn, nil
@@ -123,7 +144,7 @@ func (ri *RequestInterceptor) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	tunnelConn, err := ri.contextDialer(r.Host, r.Header, r.TLS != nil)
 	if err != nil {
 		klogAndHTTPError(w, http.StatusServiceUnavailable,
-			"fail to setup the tunnel: %s", err)
+			"could not setup the tunnel: %s", err)
 		return
 	}
 	defer tunnelConn.Close()
@@ -131,7 +152,7 @@ func (ri *RequestInterceptor) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// 2. proxy the request to tunnel
 	if err := r.Write(tunnelConn); err != nil {
 		klogAndHTTPError(w, http.StatusServiceUnavailable,
-			"fail to write request to tls connection: %s", err)
+			"could not write request to tls connection: %s", err)
 		return
 	}
 
@@ -150,7 +171,9 @@ func (ri *RequestInterceptor) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 func getResponse(r io.Reader) (*http.Response, []byte, error) {
 	rawResponse := bytes.NewBuffer(make([]byte, 0, 256))
 	// Save the bytes read while reading the response headers into the rawResponse buffer
-	resp, err := http.ReadResponse(bufio.NewReader(io.TeeReader(r, rawResponse)), nil)
+	br := newBufioReader(io.TeeReader(r, rawResponse))
+	defer putBufioReader(br)
+	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -177,7 +200,7 @@ func serveUpgradeRequest(tunnelConn net.Conn, w http.ResponseWriter, r *http.Req
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		klogAndHTTPError(w, http.StatusServiceUnavailable,
-			"fail to hijack response: %s", err)
+			"could not hijack response: %s", err)
 		return
 	}
 	defer clientConn.Close()
@@ -227,7 +250,6 @@ func serveUpgradeRequest(tunnelConn net.Conn, w http.ResponseWriter, r *http.Req
 	case <-readerComplete:
 	}
 	klog.V(4).Infof("interceptor: stop serving streaming request %s with Headers: %v", r.URL.String(), r.Header)
-	return
 }
 
 // isChunked verify the specified response is chunked stream or not.
@@ -249,9 +271,11 @@ func isChunked(response *http.Response) bool {
 
 // serverRequest serves the normal requests, e.g., kubectl logs
 func serveRequest(tunnelConn net.Conn, w http.ResponseWriter, r *http.Request) {
-	tunnelHTTPResp, err := http.ReadResponse(bufio.NewReader(tunnelConn), r)
+	br := newBufioReader(tunnelConn)
+	defer putBufioReader(br)
+	tunnelHTTPResp, err := http.ReadResponse(br, r)
 	if err != nil {
-		klogAndHTTPError(w, http.StatusServiceUnavailable, "fail to read response from the tunnel: %v", err)
+		klogAndHTTPError(w, http.StatusServiceUnavailable, "could not read response from the tunnel: %v", err)
 		return
 	}
 	klog.V(4).Infof("interceptor: successfully read the http response from the proxy tunnel for request %s", r.URL.String())
@@ -278,7 +302,7 @@ func serveRequest(tunnelConn net.Conn, w http.ResponseWriter, r *http.Request) {
 			case <-stopCh:
 				klog.V(3).Infof("chunked request(%s) normally exit", r.URL.String())
 			case <-ctx.Done():
-				klog.V(2).Infof("chunked request(%s) to agent(%s) closed by cloud client, %v", r.URL.String(), r.Header.Get(proxyHostHeaderKey), ctx.Err())
+				klog.V(2).Infof("chunked request(%s) to agent(%s) closed by cloud client, %v", r.URL.String(), r.Header.Get(constants.ProxyHostHeaderKey), ctx.Err())
 				// close connection with tunnel
 				conn.Close()
 			}
@@ -292,7 +316,7 @@ func serveRequest(tunnelConn net.Conn, w http.ResponseWriter, r *http.Request) {
 
 	_, err = io.Copy(writer, tunnelHTTPResp.Body)
 	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-		klog.ErrorS(err, "fail to copy response from the tunnel back to the client")
+		klog.ErrorS(err, "could not copy response from the tunnel back to the client")
 	}
 
 	klog.V(4).Infof("interceptor: stop serving request %s with headers: %v", r.URL.String(), r.Header)
